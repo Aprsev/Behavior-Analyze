@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Raw recordings and generated analysis artifacts
+*.mp4
+calibration.json
+trajectory.csv
+pipeline_log.txt
+arena_calibration_preview.png
+median_background.png
+
