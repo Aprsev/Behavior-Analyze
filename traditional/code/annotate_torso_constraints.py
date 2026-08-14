@@ -34,30 +34,45 @@ def simplify(points: np.ndarray, count: int = 16) -> np.ndarray:
 def scan_candidates(
     cap: cv2.VideoCapture, total: int, forward: np.ndarray, rw: int, rh: int,
     background: np.ndarray, threshold: float, pool_cap: int = 2000,
-    excluded: set = frozenset(),
+    excluded: set = frozenset(), suspicious_area: float = 0.0,
 ) -> tuple[list, list]:
     """Scan a uniform grid of frames; return (good, junk) candidate lists.
 
     good: (frame, normalized 48x48 arena descriptor, rectified torso contour)
-    junk: (frame, None) where segmentation failed or mask size is implausible
-    (mouse absent, human intervention, severe occlusion, motion blur, ...).
+    junk: (frame, None) where the automatic segmentation failed, the mask
+    size is implausible (mouse absent, human intervention, severe occlusion,
+    motion blur, ...), or - with suspicious_area > 0 - the foreground
+    difference covers an unexpectedly large share of the arena (a hand or
+    object entering the arena often evades the component filter).
     """
     step = max(1, total // pool_cap)
     good, junk = [], []
-    for f in range(0, total, step):
-        if f in excluded:
-            continue
-        cap.set(cv2.CAP_PROP_POS_FRAMES, f); ok, frame = cap.read()
+    # Sequential reading: cap.set() seeks are unreliable on MJPG (frame offset
+    # accumulates over hundreds of seeks), which would silently sample wrong
+    # frames. Reading frame by frame costs little and cannot misalign.
+    f = 0
+    while True:
+        ok, frame = cap.read()
         if not ok:
-            continue
-        rect = cv2.warpPerspective(frame, forward, (rw, rh))
-        detection = segment_mouse(rect, background, threshold, None, float('inf'), None)
-        if detection.contour is None or not (0.001 * rect.size <= detection.area <= 0.2 * rect.size):
-            junk.append((f, None))
-            continue
-        gray = cv2.resize(cv2.cvtColor(rect, cv2.COLOR_BGR2GRAY), (48, 48)).astype(np.float32)
-        gray = (gray - gray.mean()) / (gray.std() + 1e-6)
-        good.append((f, gray.ravel(), detection.contour))
+            break
+        if f % step == 0 and f not in excluded:
+            rect = cv2.warpPerspective(frame, forward, (rw, rh))
+            pixels = rect.shape[0] * rect.shape[1]  # single-channel arena size
+            if suspicious_area > 0:
+                diff = np.max(cv2.subtract(background, rect), axis=2)
+                if float(np.count_nonzero(diff > threshold)) > suspicious_area * pixels:
+                    junk.append((f, None))
+                    f += 1
+                    continue
+            detection = segment_mouse(rect, background, threshold, None, float('inf'), None)
+            if detection.contour is None or not (0.001 * pixels <= detection.area <= 0.2 * pixels):
+                junk.append((f, None))
+                f += 1
+                continue
+            gray = cv2.resize(cv2.cvtColor(rect, cv2.COLOR_BGR2GRAY), (48, 48)).astype(np.float32)
+            gray = (gray - gray.mean()) / (gray.std() + 1e-6)
+            good.append((f, gray.ravel(), detection.contour))
+        f += 1
     return good, junk
 
 
@@ -221,8 +236,10 @@ def main() -> None:
         cv2.polylines(img,[pts],True,(255,255,0),2,cv2.LINE_AA)
         for x,y in pts: cv2.circle(img,(x,y),4,(255,255,0),-1,cv2.LINE_AA)
         cv2.rectangle(img,(0,0),(img.shape[1],47),(0,0,0),-1)
-        cv2.putText(img,f'{state["i"]+1}/{len(frames)} frame={frame}: automatic body contour; adjust only fibre/tail-affected vertices',(8,19),cv2.FONT_HERSHEY_SIMPLEX,.43,(255,255,255),1)
-        cv2.putText(img,'Drag vertex / click edge add  Backspace delete  R recalculate auto  A/D step  S save  Q quit',(8,39),cv2.FONT_HERSHEY_SIMPLEX,.37,(255,255,255),1)
+        excluded_flag = bool(labels.get(frame) is not None and bool(labels[frame].exclude))
+        status = ' [EXCLUDED]' if excluded_flag else ''
+        cv2.putText(img,f'{state["i"]+1}/{len(frames)} frame={frame}{status}: automatic body contour; adjust only fibre/tail-affected vertices',(8,19),cv2.FONT_HERSHEY_SIMPLEX,.43,(0,0,255) if excluded_flag else (255,255,255),1)
+        cv2.putText(img,'Drag vertex / click edge add  Backspace delete  R recalc auto  E discard  A/D step  S save  Q quit',(8,39),cv2.FONT_HERSHEY_SIMPLEX,.37,(255,255,255),1)
         cv2.imshow(title,img); k=cv2.waitKey(20)&255
         if k in (27,ord('q')): save(); break
         if k==ord('s'):
@@ -232,6 +249,12 @@ def main() -> None:
         elif k==ord('r'): state['points']=auto_polygon(frame)
         elif k in (8,127) and len(state['points'])>3:
             idx,_=nearest(*state['points'].mean(axis=0)); state['points']=np.delete(state['points'],idx,axis=0)
+        elif k in (ord('e'),ord('E')):
+            # Discard the current frame: mark excluded and move to the next one.
+            commit_current()
+            labels[frame] = pd.Series({'frame':frame,'polygon_px':json.dumps(np.asarray(state['points']).round(1).tolist()),'exclude':True})
+            print(f'Discarded frame {frame} (excluded from training)')
+            state['i'] = min(len(frames)-1, state['i']+1); load()
         elif k in (81,ord('a')): commit_current(); state['i']=max(0,state['i']-1); load()
         elif k in (83,ord('d')): commit_current(); state['i']=min(len(frames)-1,state['i']+1); load()
         elif k==ord('j'): commit_current(); state['i']=max(0,state['i']-10); load()

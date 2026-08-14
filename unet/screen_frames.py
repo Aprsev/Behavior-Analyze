@@ -91,7 +91,8 @@ def montage_session(cap: cv2.VideoCapture, items: list[dict], video_name: str) -
                 cv2.rectangle(canvas, (x0, y0), (x0 + CELL_W, y0 + CELL_H), (0, 0, 220), 4)
                 label += "  EXCLUDED"
             if item["junk"]:
-                label += "  [junk]"
+                cv2.rectangle(canvas, (x0 + CELL_W - 78, y0 + 4), (x0 + CELL_W - 4, y0 + 30), (0, 0, 220), -1)
+                cv2.putText(canvas, "JUNK", (x0 + CELL_W - 72, y0 + 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 2)
             cv2.putText(canvas, label, (x0 + 4, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 0, 220) if idx in excluded else (20, 40, 60), 1)
         cv2.imshow(title, canvas)
         key = cv2.waitKey(25) & 255
@@ -147,15 +148,22 @@ def main() -> None:
 
         print(f"[2/3] Scanning candidates of {vp.name} ...", flush=True)
         cap = cv2.VideoCapture(str(vp))
-        good, junk = scan_candidates(cap, total, forward, rw, rh, background, threshold, 2000, set())
+        # Dense scan (every ~2 frames) with large-difference detection so that
+        # short "mouse absent / hand intervention" segments are not missed.
+        good, junk = scan_candidates(cap, total, forward, rw, rh, background, threshold,
+                                     pool_cap=4000, excluded=set(), suspicious_area=0.3)
         picks = farthest_pick(np.stack([d for _, d, _ in good]), a.per_video)
         items = []
         for i in picks:
             f, _, contour = good[i]
             src = cv2.perspectiveTransform(contour.astype(np.float32), inverse)[:, 0, :]
             items.append({"frame": int(f), "contour": src, "junk": False})
-        for f, _ in junk[: a.junk]:
-            items.append({"frame": int(f), "contour": None, "junk": True})
+        # Show junk frames spread across the whole video, not only the first N.
+        if junk:
+            indices = np.linspace(0, len(junk) - 1, min(a.junk, len(junk)), dtype=int)
+            for i in indices:
+                f, _ = junk[i]
+                items.append({"frame": int(f), "contour": None, "junk": True})
         print(f"      {len(good)} good / {len(junk)} junk frames; showing {len(items)} candidates", flush=True)
         if a.dry_run:
             for it in items:
