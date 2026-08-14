@@ -48,7 +48,7 @@ def load_corners(roi_json: Path) -> np.ndarray:
 
 def montage_session(cap: cv2.VideoCapture, items: list[dict], video_name: str) -> list[dict]:
     """Show 3x3 montage pages; user toggles excluded per candidate."""
-    title = "Screen frames | click toggle EXCLUDE | n/p page | s save | q quit"
+    title = "Screen frames | click toggle EXCLUDE | n/p page | s save | q or X to finish"
     cv2.namedWindow(title, cv2.WINDOW_NORMAL); cv2.resizeWindow(title, CANVAS)
     page = 0; total_pages = max(1, (len(items) + PAGE - 1) // PAGE)
     excluded = {i for i, it in enumerate(items) if it["junk"]}
@@ -63,6 +63,10 @@ def montage_session(cap: cv2.VideoCapture, items: list[dict], video_name: str) -
 
     cv2.setMouseCallback(title, mouse)
     while True:
+        if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+            # Window closed via the title-bar X: treat as save-and-quit.
+            print("Window closed; screening results for this video are saved.")
+            break
         canvas = np.full((CANVAS[1], CANVAS[0], 3), 240, np.uint8)
         cv2.putText(canvas, f"{video_name}  page {page+1}/{total_pages}  ({len(items)} candidates)",
                     (8, 22), cv2.FONT_HERSHEY_SIMPLEX, .55, (20, 40, 60), 1)

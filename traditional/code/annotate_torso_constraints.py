@@ -91,17 +91,44 @@ def pick_diverse_frames(
 def _select_frames(args, labels: dict, cap: cv2.VideoCapture, total: int,
                    forward: np.ndarray, rw: int, rh: int,
                    background: np.ndarray, threshold: float) -> list[int]:
-    """Prefer the manually screened candidate CSV (diverse + junk removed);
-    fall back to farthest-point diversity sampling of the whole video."""
-    if args.candidate_csv and Path(args.candidate_csv).is_file():
+    """Use the manually screened candidate CSV (diverse + junk removed).
+
+    When --candidate-csv is given but unusable (missing file, or no rows for
+    this video) the tool refuses instead of silently falling back to automatic
+    picking: an automatic fallback would reintroduce exactly the invalid
+    frames (mouse absent, human intervention) the screening pass removes.
+    Only run farthest-point sampling when no candidate CSV is requested.
+    """
+    if args.candidate_csv:
+        if not Path(args.candidate_csv).is_file():
+            raise SystemExit(f'--candidate-csv {args.candidate_csv} not found.\n'
+                             f'Run screening first: python unet/run_unet.py screen')
         cand = pd.read_csv(args.candidate_csv)
         cand = cand.loc[cand.video == Path(args.input).name]
+        if not len(cand):
+            raise SystemExit(f'No screening rows for {Path(args.input).name}.\n'
+                             f'Run screening first: python unet/run_unet.py screen')
         keep = cand.loc[~cand.exclude.fillna(False).astype(bool)].frame.astype(int)
         frames = [f for f in dict.fromkeys(int(f) for f in keep) if f not in labels]
         print(f'Using {len(frames)} screened candidate frames (junk already removed).')
         return frames[:args.max_labels]
     picks = pick_diverse_frames(cap, total, forward, rw, rh, background, threshold, args.max_labels, set())
     return [f for f, _, _ in picks if f not in labels]
+
+
+def merge_annotation_exclusions(screening_csv: str, video_name: str, label_rows: list[dict]) -> None:
+    """Record frames excluded during annotation (E key) in the screening CSV,
+    so prepare/infer also skip them. Silently skips when no screening CSV."""
+    if not screening_csv or not Path(screening_csv).is_file():
+        return
+    excluded = {int(row['frame']) for row in label_rows if bool(row.get('exclude'))}
+    if not excluded:
+        return
+    path = Path(screening_csv)
+    df = pd.read_csv(path)
+    df.loc[(df.video == video_name) & df.frame.isin(excluded), 'exclude'] = 1
+    df.to_csv(path, index=False)
+    print(f'Recorded {len(excluded)} annotation exclusions in {screening_csv}')
 
 
 def main() -> None:
@@ -187,6 +214,7 @@ def main() -> None:
         for frame,row in labels.items(): rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':bool(row.exclude)})
         Path(args.output).parent.mkdir(parents=True,exist_ok=True); pd.DataFrame(rows).sort_values('frame').to_csv(args.output,index=False)
         print(f'Saved {len(rows)} polygon torso constraints to {args.output}')
+        merge_annotation_exclusions(args.candidate_csv, Path(args.input).name, rows)
     cv2.namedWindow(title,cv2.WINDOW_NORMAL); cv2.setMouseCallback(title,mouse); load()
     while True:
         frame=frames[state['i']]; img=frame_image(frame); pts=state['points'].astype(np.int32)
