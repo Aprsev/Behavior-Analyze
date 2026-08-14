@@ -21,6 +21,10 @@ labels, screening and dataset export run over that list automatically.
 python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 python -m pip install -r unet/requirements-gpu.txt
 
+# 0b. GUI wizard: two tabs (training / processing), one click per step,
+#     live logs, video picker, new-video ROI auto-pick. tkinter only.
+python unet/run_unet.py ui
+
 # 0b. NEW video, first time: click the 4 arena corners to make its ROI JSON
 #     (saved as traditional/basic_rois/{stem}_roi.json), then add the
 #     video/roi lines to the VIDEOS list at the top of run_unet.py

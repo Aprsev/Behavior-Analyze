@@ -13,6 +13,7 @@ prepare   export polygon labels from every video into one U-Net dataset
 train     train the U-Net (best validation Dice checkpoint)
 infer     segment a new video; excluded frames -> NaN + EXCLUDED overlay
 head      body (U-Net mask centroid) + head (miniscope reflection) tracking
+ui        GUI wizard: training / processing tabs, one click per step
 
 Loop modes (compare/screen/annotate/prepare/roi) run over the VIDEOS list
 below. Single-video modes (train/infer/head) use the first video; override
@@ -214,7 +215,7 @@ def _torch_ok() -> bool:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["check", "compare", "screen", "annotate", "prepare", "train", "infer", "head", "roi"])
+    p.add_argument("mode", choices=["check", "compare", "screen", "annotate", "prepare", "train", "infer", "head", "roi", "ui"])
     p.add_argument("--interactive", action="store_true", help="pick files with dialogs (train/infer)")
     p.add_argument("--video", type=Path, help="single-video override for loop modes")
     p.add_argument("--roi", type=Path); p.add_argument("--compare-out", type=Path, dest="compare_out")
@@ -273,6 +274,10 @@ def main() -> None:
     elif a.mode == "roi":
         for cfg in videos:
             code = run(*roi_cmd(cfg)) or code
+    elif a.mode == "ui":
+        from ui import main as ui_main
+        ui_main()
+        return
     raise SystemExit(code)
 
 
