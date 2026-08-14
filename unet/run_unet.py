@@ -126,6 +126,14 @@ def infer_cmd(v: dict, a) -> tuple[Path, list[str]]:
         "--exclude-csv", str(a.screening)]
 
 
+def head_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
+    return UNET / "head_track.py", [
+        "--video", str(cfg["video"]), "--model", str(v["model"]),
+        "--roi-json", str(cfg["roi"]), "--output-dir", str(v["infer_out"]),
+        "--arena-width-cm", f"{a.arena_width_cm:.2f}", "--arena-height-cm", f"{a.arena_height_cm:.2f}",
+        "--threshold", f"{a.threshold:.2f}", "--exclude-csv", str(a.screening)]
+
+
 def run(script: Path, argv: list[str]) -> int:
     print(f"$ python {script.relative_to(ROOT)} {' '.join(argv)}")
     return subprocess.run([sys.executable, str(script), *argv]).returncode
@@ -170,7 +178,7 @@ def _torch_ok() -> bool:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["check", "compare", "screen", "annotate", "prepare", "train", "infer"])
+    p.add_argument("mode", choices=["check", "compare", "screen", "annotate", "prepare", "train", "infer", "head"])
     p.add_argument("--interactive", action="store_true", help="pick files with dialogs (train/infer)")
     p.add_argument("--video", type=Path, help="single-video override for loop modes")
     p.add_argument("--roi", type=Path); p.add_argument("--compare-out", type=Path, dest="compare_out")
@@ -222,6 +230,9 @@ def main() -> None:
     elif a.mode == "infer":
         cfg = {"video": v["video"]}
         code = run(*infer_cmd(v, a))
+    elif a.mode == "head":
+        cfg = {"video": v["video"], "roi": videos[0]["roi"]}
+        code = run(*head_cmd(v, cfg, a))
     raise SystemExit(code)
 
 

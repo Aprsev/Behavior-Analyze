@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""Combine the U-Net mask with the miniscope reflection to track body + head.
+
+For every frame:
+  - the U-Net supplies a clean mouse+miniscope mask (fibre/tail excluded);
+  - the body is the mask centroid (rectified arena coordinates -> cm);
+  - the head is the brightest compact spot INSIDE the dilated U-Net mask
+    (ReflectionTracker): the clean mask removes floor/fibre reflections that
+    used to fool the dark-background pipeline;
+  - excluded frames (--exclude-csv) become NaN rows and are marked in the
+    overlay video.
+
+Outputs: head_track_trajectory.csv, head_track_overlay.mp4,
+head_track_metadata.json.
+"""
+from __future__ import annotations
+
+import argparse, json, sys
+from pathlib import Path
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+CODE = ROOT / "traditional" / "code"
+sys.path.insert(0, str(CODE))
+from compare_head_methods import ReflectionTracker  # noqa: E402
+from mouse_behavior_pipeline import (  # noqa: E402
+    perspective_geometry, rectified_to_cm, robust_threshold, sample_frames, video_properties,
+)
+from model import UNet  # noqa: E402
+
+
+def load_corners(roi_json: Path) -> np.ndarray:
+    data = json.loads(Path(roi_json).read_text(encoding="utf-8"))
+    return np.asarray(data["arena_corners_px"], np.float32)
+
+
+def largest_component(mask: np.ndarray) -> tuple[np.ndarray, tuple[float, float] | None]:
+    n, labels, stats, cent = cv2.connectedComponentsWithStats(mask)
+    if n <= 1:
+        return np.zeros_like(mask), None
+    label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return (labels == label).astype(np.uint8) * 255, (float(cent[label][0]), float(cent[label][1]))
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--video", required=True); p.add_argument("--model", required=True)
+    p.add_argument("--roi-json", required=True); p.add_argument("--output-dir", required=True)
+    p.add_argument("--arena-width-cm", type=float, default=25.0)
+    p.add_argument("--arena-height-cm", type=float, default=30.0)
+    p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--exclude-csv", default="")
+    a = p.parse_args()
+
+    excluded: set[int] = set()
+    if a.exclude_csv and Path(a.exclude_csv).is_file():
+        ex = pd.read_csv(a.exclude_csv)
+        ex = ex.loc[ex.exclude.fillna(False).astype(bool) & (ex.video == Path(a.video).name)]
+        excluded = set(int(f) for f in ex.frame)
+        print(f"Marking {len(excluded)} screened frames as excluded")
+
+    pack = torch.load(a.model, map_location="cpu")
+    size = int(pack["size"])
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    net = UNet().to(dev); net.load_state_dict(pack["state_dict"]); net.eval()
+
+    corners = load_corners(Path(a.roi_json))
+    total, fps, _, _ = video_properties(Path(a.video))
+    rw, rh, forward, inverse, _, _ = perspective_geometry(corners, a.arena_width_cm, a.arena_height_cm)
+    _, samples = sample_frames(Path(a.video), total, 61)
+    rect_samples = np.stack([cv2.warpPerspective(f, forward, (rw, rh)) for f in samples])
+    background = np.percentile(rect_samples, 85, axis=0).astype(np.uint8)
+    robust_threshold(rect_samples, background, 0)
+
+    out = Path(a.output_dir); out.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(a.video)
+    w, h = int(cap.get(3)), int(cap.get(4))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    ow = cv2.VideoWriter(str(out / "head_track_overlay.mp4"), fourcc, fps, (w, h))
+    tracker = ReflectionTracker(fps)
+    rows = []; i = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if i in excluded:
+            body = head = None; conf = 0.0; overlay = frame.copy()
+            cv2.rectangle(overlay, (0, 0), (w - 1, h - 1), (0, 0, 220), 6)
+            cv2.putText(overlay, f"EXCLUDED frame {i}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 220), 2)
+            mask_src = None
+        else:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small = cv2.resize(gray, (size, size))
+            x = torch.from_numpy(small[None, None].copy()).float().to(dev) / 255
+            with torch.no_grad():
+                prob = torch.sigmoid(net(x))[0, 0].cpu().numpy()
+            mask_src = (cv2.resize(prob, (w, h)) >= a.threshold).astype(np.uint8) * 255
+            mask_src, body_src = largest_component(mask_src)
+            body = None; head = None; conf = 0.0
+            if body_src is not None:
+                body_mask = cv2.warpPerspective(mask_src, forward, (rw, rh), flags=cv2.INTER_NEAREST)
+                body = tuple(map(float, cv2.perspectiveTransform(np.asarray([[body_src]], np.float32), forward)[0, 0]))
+                rect = cv2.warpPerspective(frame, forward, (rw, rh))
+                head, conf, status = tracker.update(rect, background, body, body_mask)
+                if head is not None:
+                    head = tuple(float(v) for v in head)
+            overlay = frame.copy()
+            overlay[mask_src > 0] = (0, 220, 0)
+            overlay = cv2.addWeighted(frame, 0.65, overlay, 0.35, 0)
+            if body is not None:
+                b_px = cv2.perspectiveTransform(np.asarray([[body]], np.float32), inverse)[0, 0].astype(int)
+                cv2.circle(overlay, tuple(b_px), 6, (0, 0, 255), -1, cv2.LINE_AA)
+                if head is not None:
+                    h_px = cv2.perspectiveTransform(np.asarray([[head]], np.float32), inverse)[0, 0].astype(int)
+                    cv2.circle(overlay, tuple(h_px), 7, (0, 220, 255), -1, cv2.LINE_AA)
+                    cv2.line(overlay, tuple(b_px), tuple(h_px), (255, 255, 255), 1, cv2.LINE_AA)
+        ow.write(overlay)
+        body_cm = rectified_to_cm(body, rw, rh, a.arena_width_cm, a.arena_height_cm) if body else (float("nan"), float("nan"))
+        head_cm = rectified_to_cm(head, rw, rh, a.arena_width_cm, a.arena_height_cm) if head else (float("nan"), float("nan"))
+        rows.append((i, i / fps, body_cm[0], body_cm[1], head_cm[0], head_cm[1], conf))
+        i += 1
+    cap.release(); ow.release()
+    df = pd.DataFrame(rows, columns=["frame", "timestamp_sec", "body_x_cm", "body_y_cm",
+                                     "head_x_cm", "head_y_cm", "head_confidence"])
+    df.to_csv(out / "head_track_trajectory.csv", index=False, float_format="%.5f")
+    (out / "head_track_metadata.json").write_text(json.dumps(
+        {"device": dev, "frames": i, "threshold": a.threshold, "model_size": size,
+         "head_valid_percent": round(100 * float(df.head_x_cm.notna().mean()), 2),
+         "excluded_frames": sorted(excluded & set(range(i)))}, indent=2), encoding="utf-8")
+    print(f"Wrote {i} frames to {out}; head valid {df.head_x_cm.notna().mean():.1%}")
+
+
+if __name__ == "__main__":
+    main()

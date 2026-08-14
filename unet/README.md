@@ -45,6 +45,10 @@ python unet/run_unet.py train
 
 # 7. Predict a new video; excluded frames become NaN + EXCLUDED overlay
 python unet/run_unet.py infer
+
+# 8. Combined body + head tracking: U-Net mask centroid (body) +
+#    miniscope reflection inside the clean mask (head)
+python unet/run_unet.py head
 ```
 
 ### Frame selection and screening
@@ -95,6 +99,30 @@ Outputs of inference include `mouse_miniscope_mask.mp4`,
 `mouse_miniscope_overlay.mp4`, and `unet_trajectory.csv`. The trajectory
 contains the CNN mask centroid; it is a clean body input for the later
 head/reflection pipeline.
+
+### Head mode (body + miniscope reflection tracking)
+
+`python unet/run_unet.py head` runs `unet/head_track.py` on the first video
+(override with `--video`, needs `--roi`). Per frame it:
+
+1. runs the U-Net once to get the clean mouse+miniscope mask (fibre/tail and
+   floor reflections are already suppressed by the trained model);
+2. keeps only the largest connected component, transforms it into rectified
+   arena space;
+3. **body** = mask centroid, converted to cm;
+4. **head** = the brightest compact spot found *inside a dilated copy of the
+   mask* (the `ReflectionTracker` from `traditional/code/compare_head_methods.py`):
+   the U-Net mask restricts the search so floor/fibre highlights cannot be
+   mistaken for the miniscope, and the tracker adds EMA smoothing + confidence;
+5. excluded frames (from `screening.csv`) are NaN rows with an EXCLUDED border.
+
+Outputs in the inference folder:
+
+- `head_track_trajectory.csv` — `frame, timestamp_sec, body_x_cm, body_y_cm,
+  head_x_cm, head_y_cm, head_confidence`;
+- `head_track_overlay.mp4` — green U-Net mask, red body dot, yellow head dot,
+  white body→head line;
+- `head_track_metadata.json` — device, head-valid percentage, excluded frames.
 
 ## Important scope
 
