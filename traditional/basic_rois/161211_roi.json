@@ -1,0 +1,5 @@
+{
+  "input": "../../data/12026-08-12 161211.avi",
+  "arena_corners_px": [[127, 122], [500, 93], [523, 406], [146, 432]],
+  "selection_mode": "previous_manual_four_corner_perspective"
+}

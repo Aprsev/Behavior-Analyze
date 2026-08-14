@@ -110,10 +110,58 @@ class ReflectionTracker:
         return tuple(map(float, self.position)), confidence, "reflection"
 
 
+def repair_bright_floor_background(background: np.ndarray) -> np.ndarray:
+    """Remove persistent dark animal/device remnants from a bright-floor background.
+
+    Temporal percentiles fail if the animal rests in one position for most
+    calibration samples. Inpainting only pixels substantially darker than a
+    local median gives background subtraction a clean floor reference while
+    leaving the original frames untouched.
+    """
+    gray = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
+    local = cv2.medianBlur(gray, 31)
+    residual = cv2.subtract(local, gray)
+    mask = (residual > 28).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    # Restrict to meaningful dark residues; isolated compression pixels are
+    # irrelevant and should not influence the static reference.
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    cleaned = np.zeros_like(mask)
+    for label in range(1, n):
+        if stats[label, cv2.CC_STAT_AREA] >= 12:
+            cleaned[labels == label] = 255
+    return cv2.inpaint(background, cleaned, 7, cv2.INPAINT_TELEA)
+
+
 def to_cm(point, width, height, arena_w, arena_h):
     if point is None:
         return np.nan, np.nan
     return point[0] * arena_w / (width - 1), point[1] * arena_h / (height - 1)
+
+
+def confirm_recovery(frame: np.ndarray, suggested_rectified: tuple[float, float] | None, inverse: np.ndarray) -> tuple[float, float] | None:
+    """Ask once for a new body identity after sustained tracking loss."""
+    title = "Tracking lost: accept proposal or click mouse body"
+    choice: list[tuple[int, int]] = []
+    proposal = transform_point(suggested_rectified, inverse) if suggested_rectified is not None else None
+    def click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            choice[:] = [(x, y)]
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL); cv2.setMouseCallback(title, click)
+    while True:
+        preview = frame.copy()
+        cv2.rectangle(preview, (0, 0), (preview.shape[1], 48), (0, 0, 0), -1)
+        cv2.putText(preview, "Tracking lost. Yellow = proposal. Enter accept / click actual mouse body then Enter / C skip", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, .42, (255,255,255), 1, cv2.LINE_AA)
+        if proposal: cv2.circle(preview, proposal, 8, (0,255,255), 2, cv2.LINE_AA)
+        if choice: cv2.circle(preview, choice[0], 7, (0,255,0), -1, cv2.LINE_AA)
+        cv2.imshow(title, preview); key = cv2.waitKey(20) & 0xFF
+        if key in (13, 32):
+            result = choice[0] if choice else proposal
+            cv2.destroyWindow(title)
+            return result
+        if key in (27, ord("c")):
+            cv2.destroyWindow(title)
+            return None
 
 
 def main() -> None:
@@ -124,10 +172,15 @@ def main() -> None:
     parser.add_argument("--corners", default="")
     parser.add_argument("--arena-width-cm", type=float, required=True)
     parser.add_argument("--arena-height-cm", type=float, required=True)
-    parser.add_argument("--background-percentile", type=float, default=85)
+    parser.add_argument("--background-percentile", type=float, default=100, help="Use 100 for dark mouse/fibre on a bright floor")
+    parser.add_argument("--repair-background", action="store_true", help="Inpaint persistent dark mouse/fibre residue from bright-floor background")
     parser.add_argument("--threshold", type=float, default=0)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--torso-labels", default="", help="Optional manual torso-box CSV; applies exact fibre exclusion on labelled frames")
+    parser.add_argument("--initial-body-px", default="", help="Human mouse-body seed in source pixels: x,y")
+    parser.add_argument("--reseed", action="append", default=[], help="Reset identity at frame:x,y (repeatable), e.g. 300:250,380")
+    parser.add_argument("--interactive-recovery", action="store_true", help="After sustained tracking loss, pause and accept/correct a proposed mouse-body seed")
+    parser.add_argument("--recovery-gap-sec", type=float, default=.5, help="Loss duration before interactive recovery")
     args = parser.parse_args()
 
     source = Path(args.input)
@@ -137,9 +190,20 @@ def main() -> None:
     count = min(count, args.max_frames) if args.max_frames else count
     corners = roi_corners(args)
     out_w, out_h, forward, inverse, _, _ = perspective_geometry(corners, args.arena_width_cm, args.arena_height_cm)
+    initial_body = None
+    if args.initial_body_px:
+        x, y = (float(value) for value in args.initial_body_px.split(","))
+        initial_body = tuple(cv2.perspectiveTransform(np.asarray([[[x, y]]], np.float32), forward)[0, 0])
+    reseeds: dict[int, tuple[float, float]] = {}
+    for value in args.reseed:
+        frame_text, point_text = value.split(":", 1)
+        x, y = (float(v) for v in point_text.split(","))
+        reseeds[int(frame_text)] = tuple(cv2.perspectiveTransform(np.asarray([[[x, y]]], np.float32), forward)[0, 0])
     _, samples = sample_frames(source, count, 61)
     rect_samples = np.stack([cv2.warpPerspective(f, forward, (out_w, out_h)) for f in samples])
     background = np.percentile(rect_samples, np.clip(args.background_percentile, 50, 100), axis=0).astype(np.uint8)
+    if args.repair_background:
+        background = repair_bright_floor_background(background)
     threshold, _ = robust_threshold(rect_samples, background, args.threshold)
     torso_labels = pd.DataFrame()
     if args.torso_labels:
@@ -155,6 +219,7 @@ def main() -> None:
     reflection = ReflectionTracker(fps)
     previous_body = previous_bbox = None
     missing = 0
+    recovery_ready = True
     rows = []
     max_jump = max(8.0, 20 * 30.0 / fps)
     for index in range(count):
@@ -162,6 +227,14 @@ def main() -> None:
         if not ok:
             break
         rectified = cv2.warpPerspective(frame, forward, (out_w, out_h))
+        reseed_hint = None
+        if index in reseeds:
+            # An experimenter physically moved the animal: break temporal
+            # continuity deliberately and restart identity from this click.
+            previous_body = previous_bbox = None
+            silhouette.reset()
+            reflection = ReflectionTracker(fps)
+            reseed_hint = reseeds[index]
         allowed_mask = None
         if index in torso_labels.index:
             label = torso_labels.loc[index]
@@ -175,16 +248,35 @@ def main() -> None:
                 rect_box = cv2.perspectiveTransform(source_box, forward)[0].astype(np.int32)
                 allowed_mask = np.zeros((out_h, out_w), np.uint8)
                 cv2.fillConvexPoly(allowed_mask, rect_box, 255)
-        detection = segment_mouse(rectified, background, threshold, previous_body, max_jump, previous_bbox, allowed_mask)
+        startup_hint = reseed_hint if reseed_hint is not None else (initial_body if previous_body is None else None)
+        detection = segment_mouse(rectified, background, threshold, previous_body, max_jump, previous_bbox, allowed_mask, startup_hint)
         if detection.body is None:
             missing += 1
             old = silhouette.update(None, None)
             new, confidence, source_name = reflection.update(rectified, background, None, None)
+            if args.interactive_recovery and recovery_ready and missing >= max(1, round(args.recovery_gap_sec * fps)):
+                # Generate an unconstrained compact-body proposal only for the
+                # UI. The user may accept it or click the true animal.
+                proposal = segment_mouse(rectified, background, threshold, None, float("inf"), None)
+                source_seed = confirm_recovery(frame, proposal.body, inverse)
+                recovery_ready = False
+                if source_seed is not None:
+                    chosen = tuple(cv2.perspectiveTransform(np.asarray([[[source_seed[0], source_seed[1]]]], np.float32), forward)[0, 0])
+                    previous_body = previous_bbox = None
+                    silhouette.reset(); reflection = ReflectionTracker(fps)
+                    detection = segment_mouse(rectified, background, threshold, None, max_jump, None, allowed_mask, chosen)
+                    if detection.body is not None:
+                        missing = 0
+                        previous_body, previous_bbox = detection.body, detection.bbox
+                        old = silhouette.update(detection.tips, detection.body, detection.head_hint_confidence)
+                        body_mask = np.zeros((out_h, out_w), np.uint8); cv2.drawContours(body_mask, [detection.contour], -1, 255, -1)
+                        new, confidence, source_name = reflection.update(rectified, background, detection.body, body_mask)
             if missing > fps * 0.5:
                 previous_body = previous_bbox = None
                 silhouette.reset()
         else:
             missing = 0
+            recovery_ready = True
             previous_body, previous_bbox = detection.body, detection.bbox
             old = silhouette.update(detection.tips, detection.body, detection.head_hint_confidence)
             body_mask = np.zeros((out_h, out_w), np.uint8)

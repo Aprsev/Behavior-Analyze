@@ -342,3 +342,27 @@ All maintained implementation code is now under `code/`:
 
 Root-level `.py` files are compatibility launchers only, so existing commands
 continue to work. New development should import from `code.behavior_analyze`.
+## Project layout
+
+```text
+behavior_analyze/
+├── .git/                 # repository metadata stays at root
+├── data/                 # raw videos stay at root
+├── traditional/          # classical/reflection/manual-calibration code + results
+└── unet/                 # GPU-oriented CNN segmentation code
+```
+
+## Scientific desktop GUI
+
+Launch the guided desktop application with:
+
+```powershell
+python traditional/behavior_analyze_gui.py
+```
+
+The GUI uses a background `QProcess` for every long-running operation. Video
+decoding, model training and MP4 writing never run on the GUI thread, so the
+window remains responsive and the process log continues updating during long
+tasks. The recommended order is: **Prepare ROI + candidates**, adjust torso
+polygons, correct head/reflection anchors, train the calibration model, then
+run inference and inspect the annotated MP4.

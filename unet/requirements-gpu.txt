@@ -1,0 +1,7 @@
+# Install PyTorch matching the target host CUDA version first:
+# https://pytorch.org/get-started/locally/
+opencv-python>=4.8
+numpy>=1.24
+pandas>=2.0
+Pillow>=10.0
+tqdm>=4.66

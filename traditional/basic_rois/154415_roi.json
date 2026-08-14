@@ -1,0 +1,5 @@
+{
+  "input": "../../data/HQ312-freelymoving_2026-08-12_15-44-14/MiceVideo1/MiceVideo/12026-08-12 154415.avi",
+  "arena_corners_px": [[137, 102], [517, 102], [517, 405], [137, 405]],
+  "selection_mode": "previous_manual_four_corner_perspective"
+}

@@ -29,12 +29,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--corners", required=True)
+    parser.add_argument("--corners", default="", help="TLx,TLy;TRx,TRy;BRx,BRy;BLx,BLy")
+    parser.add_argument("--roi-json", default="", help="Alternative saved four-corner ROI JSON")
     parser.add_argument("--arena-width-cm", type=float, required=True)
     parser.add_argument("--arena-height-cm", type=float, required=True)
     parser.add_argument("--background-percentile", type=float, default=85.0)
     parser.add_argument("--threshold", type=float, default=0.0)
     parser.add_argument("--sample-count", type=int, default=61)
+    parser.add_argument("--max-seconds", type=float, default=0.0, help="Diagnostic duration; 0 exports full video")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -45,7 +47,12 @@ def main() -> None:
         raise RuntimeError(f"Cannot open {input_path}")
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = float(cap.get(cv2.CAP_PROP_FPS))
-    corners = parse_corners(args.corners)
+    if args.roi_json:
+        corners = np.asarray(json.loads(Path(args.roi_json).read_text(encoding="utf-8"))["arena_corners_px"], np.float32)
+    elif args.corners:
+        corners = parse_corners(args.corners)
+    else:
+        raise ValueError("Provide --corners or --roi-json")
     width = max(100, round(args.arena_width_cm * 10))
     height = max(100, round(args.arena_height_cm * 10))
     destination = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], np.float32)
@@ -79,7 +86,8 @@ def main() -> None:
         raise RuntimeError("Could not create foreground_mask.mp4")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     foreground_fraction = []
-    for index in range(nframes):
+    max_frames = min(nframes, int(round(args.max_seconds * fps))) if args.max_seconds > 0 else nframes
+    for index in range(max_frames):
         ok, frame = cap.read()
         if not ok:
             break

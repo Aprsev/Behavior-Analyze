@@ -237,6 +237,7 @@ def segment_mouse(
     previous: tuple[float, float] | None, max_tracking_jump: float = float("inf"),
     previous_bbox: tuple[int, int, int, int] | None = None,
     allowed_mask: np.ndarray | None = None,
+    initial_hint: tuple[float, float] | None = None,
 ) -> Detection:
     # One-sided background subtraction: retain only pixels darker than the
     # high-percentile floor estimate (mouse, miniscope, tail, and fibre).
@@ -268,10 +269,31 @@ def segment_mouse(
             opened = cv2.morphologyEx(component, cv2.MORPH_OPEN, tail_kernel)
             body_n, body_labels, body_stats, body_centroids = cv2.connectedComponentsWithStats(opened)
             if body_n > 1:
-                body_label = 1 + int(np.argmax(body_stats[1:, cv2.CC_STAT_AREA]))
-                body_component = (body_labels == body_label).astype(np.uint8) * 255
-                center = body_centroids[body_label]
-                body_area = int(body_stats[body_label, cv2.CC_STAT_AREA])
+                # A thick torso may be smaller in projected area than a long
+                # cable. Rank all opened islands by thickness and compactness,
+                # rather than blindly taking the largest remaining island.
+                torso_candidates = []
+                for body_label in range(1, body_n):
+                    candidate = (body_labels == body_label).astype(np.uint8) * 255
+                    x0, y0, w0, h0, candidate_area = body_stats[body_label]
+                    if candidate_area < 0.0015 * arena_area:
+                        continue
+                    contours0, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if not contours0:
+                        continue
+                    contour0 = max(contours0, key=cv2.contourArea)
+                    contour_area0 = float(cv2.contourArea(contour0))
+                    hull_area0 = float(cv2.contourArea(cv2.convexHull(contour0)))
+                    compactness0 = float(candidate_area) / max(int(w0) * int(h0), 1)
+                    solidity0 = contour_area0 / max(hull_area0, 1.0)
+                    thickness0 = float(cv2.distanceTransform(candidate, cv2.DIST_L2, 5).max())
+                    aspect0 = max(float(w0) / max(float(h0), 1), float(h0) / max(float(w0), 1))
+                    # Thick, compact blobs score above a long isolated fibre.
+                    shape_score0 = 3.5 * thickness0 + 35 * compactness0 + 12 * solidity0 - 2.5 * max(0, aspect0 - 3.5)
+                    torso_candidates.append((shape_score0, candidate, body_centroids[body_label], int(candidate_area)))
+                if not torso_candidates:
+                    continue
+                _, body_component, center, body_area = max(torso_candidates, key=lambda item: item[0])
             else:
                 body_component = component
                 center = centroids[label]
@@ -306,9 +328,20 @@ def segment_mouse(
                     ix1, iy1 = min(x + width, sx1), min(y + height, sy1)
                     overlap = max(0, ix1 - ix0) * max(0, iy1 - iy0) / max(width * height, 1)
                 # Compact torso and proximity dominate; area only breaks ties.
-                score = float(body_area) if previous is None else (
+                if previous is None and initial_hint is not None:
+                    # First-frame identity anchor: a human clicked the actual
+                    # mouse body, preventing the cable from winning startup
+                    # selection merely because it has more dark pixels.
+                    hint_distance = float(np.linalg.norm(center - np.asarray(initial_hint)))
+                    if hint_distance > 45:
+                        continue
+                    score = 5.0 * compactness + 0.0001 * body_area - hint_distance / 12.0
+                elif previous is None:
+                    score = float(body_area)
+                else:
+                    score = (
                     4.0 * overlap + 2.0 * compactness - distance / max_tracking_jump + 0.0001 * body_area
-                )
+                    )
                 options.append((score, component, body_component, body_area, center, bbox))
     if not options:
         return Detection(None, None, None, 0.0, 0.0, None)

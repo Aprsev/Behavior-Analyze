@@ -27,16 +27,25 @@ def parse_corners(value: str) -> np.ndarray:
 
 
 def select_arena_roi(frame: np.ndarray, video_name: str) -> np.ndarray:
-    """Ask the operator to draw the activity-floor rectangle on the first frame."""
-    title = f"Select white activity floor: {video_name}"
-    display = frame.copy()
-    cv2.putText(display, "Drag central white activity floor; Enter/Space = confirm, C = cancel", (12, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
-    x, y, width, height = cv2.selectROI(title, display, showCrosshair=True, fromCenter=False)
+    """Select four corners so rotated/perspective arenas are supported."""
+    title = f"Select floor corners: {video_name}"
+    points: list[tuple[int, int]] = []
+    def click(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4: points.append((x, y))
+        elif event == cv2.EVENT_RBUTTONDOWN and points: points.pop()
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL); cv2.setMouseCallback(title, click)
+    while True:
+        display = frame.copy()
+        cv2.rectangle(display, (0,0), (display.shape[1],30), (0,0,0), -1)
+        cv2.putText(display, "Click TL, TR, BR, BL; right-click undo; Enter/Space confirm", (8,21), cv2.FONT_HERSHEY_SIMPLEX, .42, (255,255,255), 1, cv2.LINE_AA)
+        for i, point in enumerate(points):
+            cv2.circle(display, point, 5, (0,255,0), -1); cv2.putText(display, ("TL","TR","BR","BL")[i], (point[0]+6,point[1]-6), cv2.FONT_HERSHEY_SIMPLEX,.45,(0,255,0),1)
+        if len(points)>1: cv2.polylines(display,[np.asarray(points,np.int32)],len(points)==4,(0,255,0),2)
+        cv2.imshow(title,display); key=cv2.waitKey(20)&255
+        if key in (13,32) and len(points)==4: break
+        if key in (27,ord('c')): cv2.destroyWindow(title); raise RuntimeError("Arena selection cancelled")
     cv2.destroyWindow(title)
-    if width < 10 or height < 10:
-        raise RuntimeError("Arena selection cancelled or too small")
-    return np.asarray([[x, y], [x + width, y], [x + width, y + height], [x, y + height]], np.float32)
+    return np.asarray(points, np.float32)
 
 
 def torso_mask(
@@ -213,7 +222,7 @@ def main() -> None:
     (output_dir / "mouse_only_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     (output_dir / "arena_roi.json").write_text(json.dumps({
         "input": str(source.resolve()), "arena_corners_px": corners.tolist(),
-        "selection_mode": "manual_rectangle" if args.select_roi else "command_line_corners",
+        "selection_mode": "manual_four_corner_perspective" if args.select_roi else "command_line_corners",
     }, indent=2), encoding="utf-8")
     print(json.dumps(metadata, indent=2))
 
