@@ -16,7 +16,7 @@ Run: python unet/run_unet.py ui
 """
 from __future__ import annotations
 
-import queue
+from collections import deque
 import subprocess
 import sys
 import threading
@@ -31,6 +31,13 @@ import run_unet as R
 FONT = ("Microsoft YaHei UI", 10)
 DONE, READY, WARN = "done", "ready", "warn"
 LOOP_STEPS = ("roi", "compare", "screen", "annotate", "prepare")
+# Log throttling: keep the UI responsive during long runs (10-min videos,
+# training). The widget keeps at most LOG_MAX_LINES, each pump inserts at
+# most LOG_PUMP_BATCH lines, and the worker-side queue is bounded so a
+# chatty child process cannot grow memory without limit.
+LOG_MAX_LINES = 4000
+LOG_PUMP_BATCH = 200
+LOG_QUEUE_MAX = 4000
 
 TRAIN_STEPS = [
     ("roi",      "① ROI 四角标注", "新视频:点竞技场 4 个角"),
@@ -71,7 +78,8 @@ class App:
         self.videos = [dict(c) for c in R.VIDEOS]
         self.current = 0
         self.proc: subprocess.Popen | None = None
-        self.log_q: queue.Queue[str] = queue.Queue()
+        self.log_q: deque[str] = deque(maxlen=LOG_QUEUE_MAX)  # drops oldest
+        self.log_lines = 0  # current line count of the log Text widget
         self.all_var = tk.BooleanVar(value=True)
         self.video_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
@@ -130,9 +138,17 @@ class App:
         return DONE if ok else READY
 
     def refresh(self) -> None:
+        # cache status_of per refresh: dependencies re-query the same keys
+        cache: dict[str, str] = {}
+
+        def st(key: str) -> str:
+            if key not in cache:
+                cache[key] = self.status_of(key)
+            return cache[key]
+
         for key, title, hint in TRAIN_STEPS + PROC_STEPS:
-            state = self.status_of(key)
-            if state == READY and any(self.status_of(d) != DONE for d in DEPENDENCIES.get(key, ())):
+            state = st(key)
+            if state == READY and any(st(d) != DONE for d in DEPENDENCIES.get(key, ())):
                 state = WARN
             label, badge = self.step_rows[key]
             label.config(text=title)
@@ -168,6 +184,9 @@ class App:
     def run_scripts(self, cmds: list[tuple[Path, list[str]]], then=None) -> None:
         if not cmds:
             return
+        if self.proc is not None and self.proc.poll() is None:
+            self.log("任务运行中，新任务已忽略（先停止当前任务）。\n")
+            return
         self.status_var.set(f"运行 {len(cmds)} 个任务 ...")
 
         def worker() -> None:
@@ -187,7 +206,7 @@ class App:
         self.log(f"$ python {Path(script).name} {' '.join(argv)}\n")
         try:
             self.proc = subprocess.Popen(
-                [sys.executable, str(script), *argv],
+                [sys.executable, "-u", str(script), *argv],  # -u: unbuffered prints
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", cwd=str(R.ROOT))
             assert self.proc.stdout is not None
@@ -203,18 +222,31 @@ class App:
             return False
 
     def log(self, text: str) -> None:
-        self.log_q.put(text)
+        self.log_q.append(text)  # deque.append is atomic under the GIL
 
     def _start_log_pump(self) -> None:
         def pump() -> None:
-            try:
-                while True:
-                    self.log_text.insert(tk.END, self.log_q.get_nowait())
-                    self.log_text.see(tk.END)
-            except queue.Empty:
-                pass
+            inserted = 0
+            while inserted < LOG_PUMP_BATCH and self.log_q:
+                try:
+                    line = self.log_q.popleft()
+                except IndexError:  # another thread drained it meanwhile
+                    break
+                self.log_text.insert(tk.END, line)
+                self.log_lines += line.count("\n")
+                inserted += 1
+            if inserted:
+                self._trim_log()
+                self.log_text.see(tk.END)
             self.root.after(120, pump)
         self.root.after(120, pump)
+
+    def _trim_log(self) -> None:
+        """Keep the widget bounded: drop the oldest lines past LOG_MAX_LINES."""
+        excess = self.log_lines - LOG_MAX_LINES
+        if excess > 0:
+            self.log_text.delete("1.0", f"{excess + 1}.0")
+            self.log_lines -= excess
 
     def stop(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -222,6 +254,9 @@ class App:
             self.log("\n--- 已请求停止 ---\n")
 
     def run_step(self, key: str) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            messagebox.showwarning("任务运行中", "当前任务尚未结束，请先停止或等待完成。")
+            return
         missing = [d for d in DEPENDENCIES.get(key, ()) if self.status_of(d) != DONE]
         if missing and not messagebox.askyesno(
                 "依赖缺失",
