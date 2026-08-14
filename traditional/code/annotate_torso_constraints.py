@@ -155,6 +155,10 @@ def main() -> None:
     args=p.parse_args()
     data=pd.read_csv(args.comparison_csv)
     old=pd.read_csv(args.output) if Path(args.output).exists() else pd.DataFrame(columns=['frame','polygon_px','exclude'])
+    if 'video' in old.columns:
+        # Multi-video labels: only rows belonging to THIS video are valid;
+        # the same frame number in another video is a different recording.
+        old = old.loc[old.video == Path(args.input).name]
     labels={int(row.frame):row for _,row in old.iterrows()}
     corners=np.asarray(json.loads(Path(args.roi_json).read_text(encoding='utf-8'))['arena_corners_px'],np.float32)
     total,fps,_,_=video_properties(Path(args.input))
@@ -226,7 +230,7 @@ def main() -> None:
     def save():
         commit_current()
         rows=[]
-        for frame,row in labels.items(): rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':bool(row.exclude)})
+        for frame,row in labels.items(): rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':bool(row.exclude),'video':Path(args.input).name})
         Path(args.output).parent.mkdir(parents=True,exist_ok=True); pd.DataFrame(rows).sort_values('frame').to_csv(args.output,index=False)
         print(f'Saved {len(rows)} polygon torso constraints to {args.output}')
         merge_annotation_exclusions(args.candidate_csv, Path(args.input).name, rows)

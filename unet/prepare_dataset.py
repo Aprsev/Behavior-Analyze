@@ -16,6 +16,11 @@ def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--video',required=True);p.add_argument('--labels',required=True);p.add_argument('--output-dir',required=True);p.add_argument('--size',type=int,default=256);p.add_argument('--exclude-csv',default='');a=p.parse_args()
  labels=pd.read_csv(a.labels); labels=labels.loc[~labels.exclude.fillna(False).astype(bool)]
  if 'polygon_px' not in labels: raise ValueError('labels must be polygon-based manual_torso_constraints.csv')
+ if 'video' in labels.columns:
+  # Multi-video labels: each row belongs to one recording; the same frame
+  # number in another video is a different image, so filter strictly.
+  labels=labels.loc[labels.video==Path(a.video).name]
+  print(f'Using {len(labels)} labels for {Path(a.video).name}')
  excluded=set()
  if a.exclude_csv and Path(a.exclude_csv).is_file():
   ex=pd.read_csv(a.exclude_csv);ex=ex.loc[ex.exclude.fillna(False).astype(bool)&(ex.video==Path(a.video).name)]
