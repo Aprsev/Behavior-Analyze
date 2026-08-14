@@ -5,6 +5,11 @@ Each selected frame starts with an automatic body contour. Drag its cyan
 vertices to exclude the fibre/tail while retaining mouse + miniscope. The
 saved polygon is an exact frame-level segmentation constraint, not a box.
 
+Frame selection is maximally diverse: pass --candidate-csv (the screening
+CSV from unet/screen_frames.py) to label exactly the screened, junk-free
+candidates; otherwise farthest-point sampling over arena descriptors picks
+the most different frames of the video. Already-labelled frames are skipped.
+
 Controls: drag cyan vertex; click edge to add vertex; Backspace removes nearest
 vertex; R restores automatic contour; E excludes frame; A/D step; J/L +/-10;
 S save; Q/Esc save and quit.
@@ -26,27 +31,101 @@ def simplify(points: np.ndarray, count: int = 16) -> np.ndarray:
     return points[np.linspace(0, len(points)-1, count, dtype=int)].astype(float)
 
 
+def scan_candidates(
+    cap: cv2.VideoCapture, total: int, forward: np.ndarray, rw: int, rh: int,
+    background: np.ndarray, threshold: float, pool_cap: int = 2000,
+    excluded: set = frozenset(),
+) -> tuple[list, list]:
+    """Scan a uniform grid of frames; return (good, junk) candidate lists.
+
+    good: (frame, normalized 48x48 arena descriptor, rectified torso contour)
+    junk: (frame, None) where segmentation failed or mask size is implausible
+    (mouse absent, human intervention, severe occlusion, motion blur, ...).
+    """
+    step = max(1, total // pool_cap)
+    good, junk = [], []
+    for f in range(0, total, step):
+        if f in excluded:
+            continue
+        cap.set(cv2.CAP_PROP_POS_FRAMES, f); ok, frame = cap.read()
+        if not ok:
+            continue
+        rect = cv2.warpPerspective(frame, forward, (rw, rh))
+        detection = segment_mouse(rect, background, threshold, None, float('inf'), None)
+        if detection.contour is None or not (0.001 * rect.size <= detection.area <= 0.2 * rect.size):
+            junk.append((f, None))
+            continue
+        gray = cv2.resize(cv2.cvtColor(rect, cv2.COLOR_BGR2GRAY), (48, 48)).astype(np.float32)
+        gray = (gray - gray.mean()) / (gray.std() + 1e-6)
+        good.append((f, gray.ravel(), detection.contour))
+    return good, junk
+
+
+def farthest_pick(descriptors: np.ndarray, count: int) -> list[int]:
+    """Greedy farthest-point sampling: pick frames whose content (position,
+    posture, appearance) differs most from everything already picked."""
+    if not len(descriptors):
+        return []
+    rng = np.random.default_rng()
+    picked = [int(rng.integers(len(descriptors)))]
+    mind = np.linalg.norm(descriptors - descriptors[picked[0]], axis=1)
+    while len(picked) < min(count, len(descriptors)):
+        j = int(np.argmax(mind)); picked.append(j)
+        mind = np.minimum(mind, np.linalg.norm(descriptors - descriptors[j], axis=1))
+    return picked
+
+
+def pick_diverse_frames(
+    cap: cv2.VideoCapture, total: int, forward: np.ndarray, rw: int, rh: int,
+    background: np.ndarray, threshold: float, count: int,
+    excluded: set = frozenset(),
+) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """Quality-filtered farthest-point frame selection across the whole video."""
+    good, _ = scan_candidates(cap, total, forward, rw, rh, background, threshold, 2000, excluded)
+    if not good:
+        return []
+    indices = farthest_pick(np.stack([d for _, d, _ in good]), count)
+    return [good[i] for i in indices]
+
+
+def _select_frames(args, labels: dict, cap: cv2.VideoCapture, total: int,
+                   forward: np.ndarray, rw: int, rh: int,
+                   background: np.ndarray, threshold: float) -> list[int]:
+    """Prefer the manually screened candidate CSV (diverse + junk removed);
+    fall back to farthest-point diversity sampling of the whole video."""
+    if args.candidate_csv and Path(args.candidate_csv).is_file():
+        cand = pd.read_csv(args.candidate_csv)
+        cand = cand.loc[cand.video == Path(args.input).name]
+        keep = cand.loc[~cand.exclude.fillna(False).astype(bool)].frame.astype(int)
+        frames = [f for f in dict.fromkeys(int(f) for f in keep) if f not in labels]
+        print(f'Using {len(frames)} screened candidate frames (junk already removed).')
+        return frames[:args.max_labels]
+    picks = pick_diverse_frames(cap, total, forward, rw, rh, background, threshold, args.max_labels, set())
+    return [f for f, _, _ in picks if f not in labels]
+
+
 def main() -> None:
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--input',required=True); p.add_argument('--comparison-csv',required=True)
     p.add_argument('--roi-json',required=True); p.add_argument('--output',required=True)
     p.add_argument('--arena-width-cm',type=float,required=True); p.add_argument('--arena-height-cm',type=float,required=True)
-    p.add_argument('--max-labels',type=int,default=50); args=p.parse_args()
+    p.add_argument('--max-labels',type=int,default=50); p.add_argument('--candidate-csv',default='')
+    args=p.parse_args()
     data=pd.read_csv(args.comparison_csv)
-    confidence=data.reflection_confidence.fillna(0).to_numpy(float)
-    picks=list(data.iloc[np.argsort(confidence)[:max(1,args.max_labels//2)]].frame.astype(int))
-    picks+=list(data.iloc[np.linspace(0,len(data)-1,max(1,args.max_labels-len(picks)),dtype=int)].frame.astype(int))
-    frames=list(dict.fromkeys(picks))[:args.max_labels]
     old=pd.read_csv(args.output) if Path(args.output).exists() else pd.DataFrame(columns=['frame','polygon_px','exclude'])
     labels={int(row.frame):row for _,row in old.iterrows()}
     corners=np.asarray(json.loads(Path(args.roi_json).read_text(encoding='utf-8'))['arena_corners_px'],np.float32)
-    _,fps,_,_=video_properties(Path(args.input))
+    total,fps,_,_=video_properties(Path(args.input))
     rw,rh,forward,inverse,_,_=perspective_geometry(corners,args.arena_width_cm,args.arena_height_cm)
-    _,samples=sample_frames(Path(args.input),int(data.frame.max())+1,61)
+    _,samples=sample_frames(Path(args.input),total,61)
     rect_samples=np.stack([cv2.warpPerspective(frame,forward,(rw,rh)) for frame in samples])
     background=np.percentile(rect_samples,85,axis=0).astype(np.uint8)
     threshold,_=robust_threshold(rect_samples,background,0)
     cap=cv2.VideoCapture(args.input); title='Polygon torso correction (cyan); remove fibre/tail'
+    frames=_select_frames(args,labels,cap,total,forward,rw,rh,background,threshold)
+    if not frames:
+        print('No new frames to label: all screened candidates are already labelled.')
+        cap.release(); return
     state={'i':0,'points':None,'drag':None}
     def frame_image(frame):
         cap.set(cv2.CAP_PROP_POS_FRAMES,frame); ok,img=cap.read()
