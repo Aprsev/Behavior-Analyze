@@ -21,6 +21,11 @@ labels, screening and dataset export run over that list automatically.
 python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 python -m pip install -r unet/requirements-gpu.txt
 
+# 0b. NEW video, first time: click the 4 arena corners to make its ROI JSON
+#     (saved as traditional/basic_rois/{stem}_roi.json), then add the
+#     video/roi lines to the VIDEOS list at the top of run_unet.py
+python unet/run_unet.py roi --video "data/new.avi"
+
 # 1. Status overview: what exists, what is missing
 python unet/run_unet.py check
 
@@ -50,6 +55,21 @@ python unet/run_unet.py infer
 #    miniscope reflection inside the clean mask (head)
 python unet/run_unet.py head
 ```
+
+### Running on a brand-new video (no manual path editing)
+
+- Only inference (use the trained model, no retraining):
+
+  ```powershell
+  python unet/run_unet.py roi --video "data/new.avi"  # 1. click 4 arena corners -> ROI JSON
+  python unet/run_unet.py head --interactive          # 2. pick video / ROI / model / output dir
+  ```
+  (`infer --interactive` works the same way, minus the ROI dialog.)
+  The dialogs pre-fill with the defaults, so plain Enter accepts them.
+
+- To add the video to training, append a dict to the `VIDEOS` list in
+  `run_unet.py` (3 lines), then run `compare screen annotate prepare train`
+  once each over the whole list.
 
 ### Frame selection and screening
 

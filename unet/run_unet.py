@@ -4,6 +4,7 @@
 Modes
 -----
 check     print what exists and what is still missing
+roi       interactive arena-corner picker for a NEW video (make_roi.py)
 compare   (re)generate head_method_comparison.csv for every video
 screen    pick maximally diverse frames + manually exclude junk frames
           (mouse absent, human intervention, ...) -> screening.csv
@@ -11,10 +12,12 @@ annotate  open the torso-polygon labelling window on the screened frames
 prepare   export polygon labels from every video into one U-Net dataset
 train     train the U-Net (best validation Dice checkpoint)
 infer     segment a new video; excluded frames -> NaN + EXCLUDED overlay
+head      body (U-Net mask centroid) + head (miniscope reflection) tracking
 
-Loop modes (compare/screen/annotate/prepare) run over the VIDEOS list below.
-Single-video modes (train/infer) use the first video; override with --video.
-Add --interactive to pick files with dialogs (train/infer only).
+Loop modes (compare/screen/annotate/prepare/roi) run over the VIDEOS list
+below. Single-video modes (train/infer/head) use the first video; override
+with --video. Add --interactive to pick files with dialogs (train/infer/head:
+head also asks for the ROI JSON).
 """
 from __future__ import annotations
 
@@ -77,10 +80,12 @@ def pick_dir(title: str, initial: Path) -> str:
 def apply_dialogs(v: dict, mode: str) -> dict:
     if mode == "train":
         v["dataset"] = Path(pick_dir("Select dataset dir (with images/ and masks/)", v["dataset"]) or v["dataset"])
-    if mode == "infer":
+    if mode in ("infer", "head"):
         v["video"] = Path(pick_file("Select source video", v["video"].parent, "*.avi *.mp4 *.mov *.mkv") or v["video"])
         v["model"] = Path(pick_file("Select best_unet.pt", v["model"].parent, "*.pt") or v["model"])
         v["infer_out"] = Path(pick_dir("Select inference output dir", v["infer_out"]) or v["infer_out"])
+    if mode == "head":
+        v["roi"] = Path(pick_file("Select ROI JSON (arena corners)", v["roi"].parent, "*.json") or v["roi"])
     return v
 
 
@@ -134,6 +139,10 @@ def head_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
         "--threshold", f"{a.threshold:.2f}", "--exclude-csv", str(a.screening)]
 
 
+def roi_cmd(v: dict) -> tuple[Path, list[str]]:
+    return UNET / "make_roi.py", ["--video", str(v["video"])]
+
+
 def run(script: Path, argv: list[str]) -> int:
     print(f"$ python {script.relative_to(ROOT)} {' '.join(argv)}")
     return subprocess.run([sys.executable, str(script), *argv]).returncode
@@ -178,7 +187,7 @@ def _torch_ok() -> bool:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["check", "compare", "screen", "annotate", "prepare", "train", "infer", "head"])
+    p.add_argument("mode", choices=["check", "compare", "screen", "annotate", "prepare", "train", "infer", "head", "roi"])
     p.add_argument("--interactive", action="store_true", help="pick files with dialogs (train/infer)")
     p.add_argument("--video", type=Path, help="single-video override for loop modes")
     p.add_argument("--roi", type=Path); p.add_argument("--compare-out", type=Path, dest="compare_out")
@@ -205,7 +214,8 @@ def main() -> None:
             p.error("--video override needs --roi and --compare-out")
         videos = [cfg]
     v = {"video": videos[0]["video"], "model": a.model, "infer_out": a.infer_out,
-         "dataset": a.dataset, "labels": a.labels, "screening": a.screening}
+         "dataset": a.dataset, "labels": a.labels, "screening": a.screening,
+         "roi": videos[0]["roi"]}
     if a.interactive:
         v = apply_dialogs(v, a.mode)
 
@@ -231,8 +241,11 @@ def main() -> None:
         cfg = {"video": v["video"]}
         code = run(*infer_cmd(v, a))
     elif a.mode == "head":
-        cfg = {"video": v["video"], "roi": videos[0]["roi"]}
+        cfg = {"video": v["video"], "roi": v["roi"]}
         code = run(*head_cmd(v, cfg, a))
+    elif a.mode == "roi":
+        for cfg in videos:
+            code = run(*roi_cmd(cfg)) or code
     raise SystemExit(code)
 
 
