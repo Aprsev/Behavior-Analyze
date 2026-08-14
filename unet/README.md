@@ -61,11 +61,15 @@ python unet/run_unet.py head
 - Only inference (use the trained model, no retraining):
 
   ```powershell
-  python unet/run_unet.py roi --video "data/new.avi"  # 1. click 4 arena corners -> ROI JSON
-  python unet/run_unet.py head --interactive          # 2. pick video / ROI / model / output dir
+  python unet/run_unet.py head --interactive
   ```
-  (`infer --interactive` works the same way, minus the ROI dialog.)
-  The dialogs pre-fill with the defaults, so plain Enter accepts them.
+  The first dialog asks for the video; the ROI is then resolved
+  automatically — existing `{stem}_roi.json`, or any basic_rois JSON whose
+  `input` field points at the video, or (if none exists) the corner picker
+  opens right there so you can click the 4 arena corners on the spot. Then
+  pick the model and the output dir. (`infer --interactive` works the same
+  way, minus the ROI dialog.) All dialogs pre-fill with the defaults, so
+  plain Enter accepts them.
 
 - To add the video to training, append a dict to the `VIDEOS` list in
   `run_unet.py` (3 lines), then run `compare screen annotate prepare train`

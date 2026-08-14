@@ -22,6 +22,7 @@ head also asks for the ROI JSON).
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +78,32 @@ def pick_dir(title: str, initial: Path) -> str:
     return path
 
 
+def pick_or_create_roi(video: Path) -> Path:
+    """ROI for the picked video; auto-opens the corner picker when a new
+    recording has none yet, so head --interactive needs no separate roi
+    step. Lookup order: default {stem}_roi.json -> any basic_rois JSON whose
+    "input" field points at this video -> interactive corner picker.
+    On cancel/error falls back to picking an existing JSON."""
+    rois = ROOT / "traditional" / "basic_rois"
+    default = rois / f"{video.stem}_roi.json"
+    if default.is_file():
+        return default
+    for f in sorted(rois.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if str(data.get("input", "")).replace("\\", "/").endswith(video.name):
+                return f
+        except (json.JSONDecodeError, OSError):
+            continue
+    print(f"No ROI JSON for {video.name}; opening the corner picker "
+          "(click the 4 arena corners, S to save, Q to cancel)...")
+    code = run(UNET / "make_roi.py", ["--video", str(video)])
+    if not code and default.is_file():
+        return default
+    picked = pick_file("Select ROI JSON (arena corners)", default.parent, "*.json")
+    return Path(picked) if picked else default
+
+
 def apply_dialogs(v: dict, mode: str) -> dict:
     if mode == "train":
         v["dataset"] = Path(pick_dir("Select dataset dir (with images/ and masks/)", v["dataset"]) or v["dataset"])
@@ -85,7 +112,7 @@ def apply_dialogs(v: dict, mode: str) -> dict:
         v["model"] = Path(pick_file("Select best_unet.pt", v["model"].parent, "*.pt") or v["model"])
         v["infer_out"] = Path(pick_dir("Select inference output dir", v["infer_out"]) or v["infer_out"])
     if mode == "head":
-        v["roi"] = Path(pick_file("Select ROI JSON (arena corners)", v["roi"].parent, "*.json") or v["roi"])
+        v["roi"] = pick_or_create_roi(v["video"])
     return v
 
 
