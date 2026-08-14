@@ -32,6 +32,26 @@ from mouse_behavior_pipeline import (  # noqa: E402
 from model import UNet  # noqa: E402
 
 
+def rot_pt(p: tuple[float, float], k: int, h: int, w: int) -> tuple[float, float]:
+    """(col,row) in an (h,w) frame -> (col,row) in np.rot90(frame, k)."""
+    x, y = p
+    for _ in range(k % 4):
+        x, y = y, w - 1 - x
+        h, w = w, h
+    return x, y
+
+
+def inv_rot_pt(p: tuple[float, float], k: int, h: int, w: int) -> tuple[float, float]:
+    """inverse of rot_pt (p is in the rotated frame)."""
+    x, y = p
+    for _ in range(k % 4):
+        h, w = w, h
+    for _ in range(k % 4):
+        x, y = h - 1 - y, x
+        h, w = w, h
+    return x, y
+
+
 def load_corners(roi_json: Path) -> np.ndarray:
     data = json.loads(Path(roi_json).read_text(encoding="utf-8"))
     return np.asarray(data["arena_corners_px"], np.float32)
@@ -52,6 +72,9 @@ def main() -> None:
     p.add_argument("--arena-width-cm", type=float, default=25.0)
     p.add_argument("--arena-height-cm", type=float, default=30.0)
     p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                   help="arena turned vs training: rotate frames before the CNN "
+                        "(ROI corners are rotated too; output stays in source space)")
     p.add_argument("--exclude-csv", default="")
     a = p.parse_args()
 
@@ -68,10 +91,17 @@ def main() -> None:
     net = UNet().to(dev); net.load_state_dict(pack["state_dict"]); net.eval()
 
     corners = load_corners(Path(a.roi_json))
+    cap = cv2.VideoCapture(a.video)
+    w, h = int(cap.get(3)), int(cap.get(4))
+    k = int(a.rotate) // 90 % 4
+    if k:
+        # Arena turned by a quarter-turn: rotate the frame for the CNN and
+        # rotate the ROI corners the same way so perspective stays aligned.
+        corners = np.asarray([rot_pt(tuple(c), k, h, w) for c in corners], np.float32)
     total, fps, _, _ = video_properties(Path(a.video))
     rw, rh, forward, inverse, _, _ = perspective_geometry(corners, a.arena_width_cm, a.arena_height_cm)
     _, samples = sample_frames(Path(a.video), total, 61)
-    rect_samples = np.stack([cv2.warpPerspective(f, forward, (rw, rh)) for f in samples])
+    rect_samples = np.stack([cv2.warpPerspective(np.rot90(f, k) if k else f, forward, (rw, rh)) for f in samples])
     background = np.percentile(rect_samples, 85, axis=0).astype(np.uint8)
     robust_threshold(rect_samples, background, 0)
 
@@ -86,9 +116,11 @@ def main() -> None:
         ok, frame = cap.read()
         if not ok:
             break
+        if k:
+            frame = np.rot90(frame, k)  # everything below works in rotated space
         if i in excluded:
             body = head = None; conf = 0.0; overlay = frame.copy()
-            cv2.rectangle(overlay, (0, 0), (w - 1, h - 1), (0, 0, 220), 6)
+            cv2.rectangle(overlay, (0, 0), (overlay.shape[1] - 1, overlay.shape[0] - 1), (0, 0, 220), 6)
             cv2.putText(overlay, f"EXCLUDED frame {i}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 220), 2)
             mask_src = None
         else:
@@ -97,7 +129,7 @@ def main() -> None:
             x = torch.from_numpy(small[None, None].copy()).float().to(dev) / 255
             with torch.no_grad():
                 prob = torch.sigmoid(net(x))[0, 0].cpu().numpy()
-            mask_src = (cv2.resize(prob, (w, h)) >= a.threshold).astype(np.uint8) * 255
+            mask_src = (cv2.resize(prob, (frame.shape[1], frame.shape[0])) >= a.threshold).astype(np.uint8) * 255
             mask_src, body_src = largest_component(mask_src)
             body = None; head = None; conf = 0.0
             if body_src is not None:
@@ -117,7 +149,7 @@ def main() -> None:
                     h_px = cv2.perspectiveTransform(np.asarray([[head]], np.float32), inverse)[0, 0].astype(int)
                     cv2.circle(overlay, tuple(h_px), 7, (0, 220, 255), -1, cv2.LINE_AA)
                     cv2.line(overlay, tuple(b_px), tuple(h_px), (255, 255, 255), 1, cv2.LINE_AA)
-        ow.write(overlay)
+        ow.write(np.rot90(overlay, -k) if k else overlay)
         body_cm = rectified_to_cm(body, rw, rh, a.arena_width_cm, a.arena_height_cm) if body else (float("nan"), float("nan"))
         head_cm = rectified_to_cm(head, rw, rh, a.arena_width_cm, a.arena_height_cm) if head else (float("nan"), float("nan"))
         rows.append((i, i / fps, body_cm[0], body_cm[1], head_cm[0], head_cm[1], conf))
@@ -127,7 +159,7 @@ def main() -> None:
                                      "head_x_cm", "head_y_cm", "head_confidence"])
     df.to_csv(out / "head_track_trajectory.csv", index=False, float_format="%.5f")
     (out / "head_track_metadata.json").write_text(json.dumps(
-        {"device": dev, "frames": i, "threshold": a.threshold, "model_size": size,
+        {"device": dev, "frames": i, "threshold": a.threshold, "rotate": a.rotate, "model_size": size,
          "head_valid_percent": round(100 * float(df.head_x_cm.notna().mean()), 2),
          "excluded_frames": sorted(excluded & set(range(i)))}, indent=2), encoding="utf-8")
     print(f"Wrote {i} frames to {out}; head valid {df.head_x_cm.notna().mean():.1%}")

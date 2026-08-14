@@ -128,6 +128,21 @@ Outputs of inference include `mouse_miniscope_mask.mp4`,
 contains the CNN mask centroid; it is a clean body input for the later
 head/reflection pipeline.
 
+### Arena turned? (rotation robustness)
+
+If a new recording looks like the arena was rotated a quarter-turn vs the
+training videos, two layers fix it:
+
+1. **Inference-side alignment (no retraining)**: `--rotate 90/180/270` on
+   `infer`/`head` rotates the frames before the CNN and rotates the mask /
+   centroid / ROI corners back, so the model always sees the training
+   orientation. In the GUI: the "画面旋转校正" dropdown in the processing tab.
+2. **Training-side augmentation (root cause)**: `train.py` now rotates
+   training pairs by 90/180/270 degrees (zero border artifacts), adds gamma
+   lighting curves, sensor noise and mild blur. Retrain once
+   (`python unet/run_unet.py train`) and the model handles any quarter-turn
+   plus small angular tilts and lighting differences on its own.
+
 ### Head mode (body + miniscope reflection tracking)
 
 `python unet/run_unet.py head` runs `unet/head_track.py` on the first video

@@ -13,10 +13,21 @@ class Pairs(Dataset):
  def __getitem__(self,i):
   f=self.files[i];x=cv2.imread(str(self.root/'images'/f),0);y=cv2.imread(str(self.root/'masks'/f),0)
   if self.augment:
+   # 90-degree family: covers arena rotations (e.g. camera/box turned 90,
+   # 180 or 270 degrees) with zero border artifacts - np.rot90 has none.
+   k=random.randint(0,3)
+   if k:x,y=np.rot90(x,k).copy(),np.rot90(y,k).copy()
    if random.random()<.5:x,y=np.fliplr(x).copy(),np.fliplr(y).copy()
    if random.random()<.5:x,y=np.flipud(x).copy(),np.flipud(y).copy()
    angle=random.uniform(-18,18);m=cv2.getRotationMatrix2D((x.shape[1]/2,x.shape[0]/2),angle,1);x=cv2.warpAffine(x,m,x.shape[::-1],borderMode=cv2.BORDER_REFLECT);y=cv2.warpAffine(y,m,y.shape[::-1],flags=cv2.INTER_NEAREST)
-   x=np.clip(x.astype(np.float32)*random.uniform(.75,1.25)+random.uniform(-12,12),0,255).astype(np.uint8)
+   # lighting: affine brightness + non-linear gamma curve (different lamps,
+   # white balance) - gamma is what linear scale+offset cannot model
+   x=np.clip(x.astype(np.float32)*random.uniform(.75,1.25)+random.uniform(-12,12),0,255)
+   if random.random()<.6:x=255.0*(x/255.0)**random.uniform(.7,1.4)
+   # sensor noise + mild blur (different camera / focus)
+   if random.random()<.5:x+=np.random.normal(0,random.uniform(1,6),x.shape)
+   if random.random()<.3:x=cv2.GaussianBlur(np.clip(x,0,255).astype(np.uint8),(3,3),0)
+   x=np.clip(x,0,255).astype(np.uint8)
   return torch.from_numpy(x[None].copy()).float()/255,torch.from_numpy((y[None]>127).copy()).float()
 def dice(logits,target):
  p=torch.sigmoid(logits);return (2*(p*target).sum()+1)/((p+target).sum()+1)

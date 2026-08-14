@@ -156,7 +156,7 @@ def infer_cmd(v: dict, a) -> tuple[Path, list[str]]:
     return UNET / "infer.py", [
         "--video", str(v["video"]), "--model", str(v["model"]),
         "--output-dir", str(v["infer_out"]), "--threshold", f"{a.threshold:.2f}",
-        "--exclude-csv", str(a.screening)]
+        "--rotate", str(a.rotate), "--exclude-csv", str(a.screening)]
 
 
 def head_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
@@ -164,7 +164,8 @@ def head_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
         "--video", str(cfg["video"]), "--model", str(v["model"]),
         "--roi-json", str(cfg["roi"]), "--output-dir", str(v["infer_out"]),
         "--arena-width-cm", f"{a.arena_width_cm:.2f}", "--arena-height-cm", f"{a.arena_height_cm:.2f}",
-        "--threshold", f"{a.threshold:.2f}", "--exclude-csv", str(a.screening)]
+        "--threshold", f"{a.threshold:.2f}", "--rotate", str(a.rotate),
+        "--exclude-csv", str(a.screening)]
 
 
 def roi_cmd(v: dict) -> tuple[Path, list[str]]:
@@ -233,6 +234,8 @@ def main() -> None:
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                   help="arena turned vs training: rotate input frames for infer/head")
     a = p.parse_args()
 
     videos = list(VIDEOS)

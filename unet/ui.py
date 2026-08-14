@@ -67,7 +67,7 @@ def build_args() -> Namespace:
         model=R.MODEL, infer_out=R.INFER_OUT,
         arena_width_cm=R.ARENA_WIDTH_CM, arena_height_cm=R.ARENA_HEIGHT_CM,
         max_labels=100, per_video=40, junk=20, size=256,
-        epochs=80, batch_size=8, threshold=0.5,
+        epochs=80, batch_size=8, threshold=0.5, rotate=0,
     )
 
 
@@ -81,6 +81,7 @@ class App:
         self.log_q: deque[str] = deque(maxlen=LOG_QUEUE_MAX)  # drops oldest
         self.log_lines = 0  # current line count of the log Text widget
         self.all_var = tk.BooleanVar(value=True)
+        self.rotate_var = tk.IntVar(value=0)
         self.video_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
         self.step_rows: dict[str, tuple[tk.Label, tk.Label]] = {}
@@ -159,6 +160,7 @@ class App:
     def commands_for(self, key: str) -> list[tuple[Path, list[str]]]:
         w = f"{self.args.arena_width_cm:.2f}"
         h = f"{self.args.arena_height_cm:.2f}"
+        self.args.rotate = int(self.rotate_var.get())
         loop = self.all_var.get() and key in LOOP_STEPS
         cfgs = [self.local_cfg(c) for c in self.videos] if loop else [self.local_cfg(self.current_cfg())]
         if key == "roi":
@@ -339,6 +341,14 @@ class App:
         ttk.Separator(tab_train).pack(fill="x", pady=6)
         for spec in PROC_STEPS:
             self._step_row(tab_proc, *spec)
+        rot_row = ttk.Frame(tab_proc)
+        rot_row.pack(fill="x", pady=6)
+        ttk.Label(rot_row, text="画面旋转校正:", font=FONT).pack(side="left")
+        self.rotate_combo = ttk.Combobox(rot_row, textvariable=self.rotate_var, state="readonly",
+                                         values=[0, 90, 180, 270], width=6, font=FONT)
+        self.rotate_combo.pack(side="left", padx=4)
+        ttk.Label(rot_row, text="(旷场相对训练视频转了 90/180/270° 时选择,推理时先把画面转正再分割)",
+                  font=("Microsoft YaHei UI", 9), foreground="#666666").pack(side="left")
 
         # video bar (shared)
         bar = ttk.Frame(root)
