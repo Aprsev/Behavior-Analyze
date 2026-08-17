@@ -131,6 +131,7 @@ def screen_cmd(cfg: dict, w: str, h: str, a) -> tuple[Path, list[str]]:
     return UNET / "screen_frames.py", [
         "--video", str(cfg["video"]), "--roi", str(cfg["roi"]), "--output", str(a.screening),
         "--per-video", str(a.per_video), "--junk", str(a.junk),
+        "--labels", str(a.labels),
         "--arena-width-cm", w, "--arena-height-cm", h]
 
 

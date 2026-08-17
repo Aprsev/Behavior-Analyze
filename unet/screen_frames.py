@@ -9,7 +9,10 @@ For every input video this tool:
   3. picks --per-video good frames (default 10) spread across the whole
      video: the recording is divided into --per-video equal time bins and
      the most content-distinct frame of each bin is taken, so the selection
-     never clusters near-duplicate frames in one time period;
+     never clusters near-duplicate frames in one time period; with
+     --labels (the annotation CSV) already-labelled frames are skipped, so
+     re-running screen after annotate proposes NEW frames - annotations
+     are never repeated or discarded;
   4. appends up to --junk junk frames, pre-excluded;
   5. shows a 3x3 montage: click a cell to toggle EXCLUDED (red border);
      junk frames start excluded and can be re-included if wrongly flagged.
@@ -147,6 +150,11 @@ def save_rows(output: Path, rows: list[dict]) -> None:
     if output.exists():
         old = pd.read_csv(output)
         df = pd.concat([old, df], ignore_index=True)
+    # Re-running screen must never pile up duplicate candidates: keep the
+    # newest row per (video, frame), so counters stay exact and the
+    # annotator never sees a frame twice.
+    df = df.drop_duplicates(subset=["video", "frame"], keep="last")
+    df = df.sort_values(["video", "frame"]).reset_index(drop=True)
     output.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output, index=False)
     print(f"Saved {len(df)} screening rows to {output}")
@@ -159,6 +167,9 @@ def main() -> None:
     p.add_argument("--output", default=str(Path(__file__).resolve().parents[1] / "traditional" / "results" / "screening.csv"))
     p.add_argument("--per-video", type=int, default=10, help="diverse candidates to label per video")
     p.add_argument("--junk", type=int, default=20, help="junk frames shown per video (pre-excluded)")
+    p.add_argument("--labels", default="",
+                   help="manual_torso_constraints.csv: already-labelled frames are skipped, so re-running "
+                        "screen proposes NEW frames instead of the ones you already did")
     p.add_argument("--arena-width-cm", type=float, default=25.0)
     p.add_argument("--arena-height-cm", type=float, default=30.0)
     p.add_argument("--dry-run", action="store_true", help="print the selection without opening a window")
@@ -184,6 +195,21 @@ def main() -> None:
         # short "mouse absent / hand intervention" segments are not missed.
         good, junk = scan_candidates(cap, total, forward, rw, rh, background, threshold,
                                      pool_cap=4000, excluded=set(), suspicious_area=0.3)
+        # Already-labelled frames are never proposed again: re-running screen
+        # after annotate picks NEW frames, so screen -> annotate rounds
+        # incrementally cover the whole video without repeating work.
+        if a.labels and Path(a.labels).is_file():
+            lab = pd.read_csv(a.labels)
+            if "video" in lab.columns:
+                lab = lab.loc[lab.video == vp.name]
+            done = {int(f) for f in lab.loc[~lab.exclude.fillna(False).astype(bool)].frame.astype(int)}
+            before = len(good)
+            good = [g for g in good if g[0] not in done]
+            if done:
+                print(f"      skipping {before - len(good)} already-labelled frames", flush=True)
+        if not good:
+            print(f"      no new candidates for {vp.name}: every screened frame is already labelled", flush=True)
+            continue
         picks = farthest_pick_binned(np.stack([d for _, d, _ in good]), a.per_video)
         items = []
         for i in picks:
