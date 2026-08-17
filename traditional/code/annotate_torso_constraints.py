@@ -131,6 +131,26 @@ def _select_frames(args, labels: dict, cap: cv2.VideoCapture, total: int,
     return [f for f, _, _ in picks if f not in labels]
 
 
+def merge_labels(path: Path, video_name: str, rows: list[dict]) -> None:
+    """Upsert this video's rows into the shared labels CSV.
+
+    The CSV holds annotations for EVERY video. A naive write of just this
+    video's rows would silently delete all other videos' annotations the
+    moment a second video is annotated - the classic "my old annotations
+    disappeared" bug. Only the (video, frame) pairs touched in this session
+    are replaced; every other row is kept byte-for-byte.
+    """
+    old = pd.read_csv(path) if path.exists() else pd.DataFrame(columns=["frame", "polygon_px", "exclude"])
+    if "video" not in old.columns:
+        old["video"] = video_name  # legacy single-video CSV: all rows are ours
+    touched = [r["frame"] for r in rows]
+    keep = ~((old.video == video_name) & old.frame.isin(touched))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.concat([old.loc[keep], pd.DataFrame(rows)], ignore_index=True) \
+        .sort_values(["video", "frame"]).to_csv(path, index=False)
+    print(f"Saved {len(rows)} polygon torso constraints to {path}")
+
+
 def merge_annotation_exclusions(screening_csv: str, video_name: str, label_rows: list[dict]) -> None:
     """Record frames excluded during annotation (E key) in the screening CSV,
     so prepare/infer also skip them. Silently skips when no screening CSV."""
@@ -234,8 +254,9 @@ def main() -> None:
         commit_current()
         rows=[]
         for frame,row in labels.items(): rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':bool(row.exclude),'video':Path(args.input).name})
-        Path(args.output).parent.mkdir(parents=True,exist_ok=True); pd.DataFrame(rows).sort_values('frame').to_csv(args.output,index=False)
-        print(f'Saved {len(rows)} polygon torso constraints to {args.output}')
+        # Merge into the shared CSV: this session only replaces its own
+        # (video, frame) rows; every other video's annotations are kept.
+        merge_labels(Path(args.output), Path(args.input).name, rows)
         merge_annotation_exclusions(args.candidate_csv, Path(args.input).name, rows)
     cv2.namedWindow(title,cv2.WINDOW_NORMAL); cv2.setMouseCallback(title,mouse); load()
     while True:
