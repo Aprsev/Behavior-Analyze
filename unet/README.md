@@ -104,6 +104,29 @@ Run `prepare` once per video (the launcher does this for the whole `VIDEOS`
 list). Image names are `{video_stem}_{frame:07d}.png`, so frame numbers never
 collide between videos, and `dataset.json` accumulates one entry per video.
 
+### Background-invariant preprocessing (inter-video background differences)
+
+A single recording has an almost static background, but different recordings
+may look very different (arena, lamp, camera). To stop the U-Net from
+memorizing one arena's appearance, the pipeline now centers every input on
+the video's own background before the CNN:
+
+- `prepare_dataset.py` samples ~61 frames spread over the video and caches
+  the per-pixel 85th-percentile background as `<dataset>/backgrounds/<stem>.png`;
+- `train.py` transforms each image to `x' = 128 + 2*(gray - bg)` **before**
+  the usual augmentations, i.e. the static background becomes mid-gray and
+  only deviations (mouse, miniscope, shadow) survive;
+- the checkpoint records `"bg_subtract": true`;
+- `infer.py` / `head_track.py` read that flag and apply the identical
+  transform at inference (estimating the background with the same function,
+  rotated together with `--rotate` frames). Old checkpoints without the flag
+  keep the raw-input behaviour, so nothing breaks until you retrain.
+
+One-time migration after pulling: rerun `prepare` (⑤) once so every video
+gets its background cache, then `train` (⑥). Training only enables the
+transform when **every** video in the dataset has a cache; a mixed dataset
+falls back to raw frames with a warning.
+
 ## Direct commands (without the launcher)
 
 ```powershell

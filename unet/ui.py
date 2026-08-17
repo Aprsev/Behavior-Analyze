@@ -18,11 +18,14 @@ Run: python unet/run_unet.py ui
 from __future__ import annotations
 
 from collections import deque
+import json
 import subprocess
 import sys
 import threading
 from argparse import Namespace
 from pathlib import Path
+
+import pandas as pd
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -66,6 +69,8 @@ DEPENDENCIES = {
 STATE_TEXT = {DONE: "✓ 完成", READY: "○ 待运行", WARN: "△ 依赖缺失"}
 STATE_COLOR = {DONE: "#1a7f37", READY: "#0b57d0", WARN: "#b06000"}
 _PICK_KEYS = ("pick_video", "pick_roi", "pick_outdir")
+# training steps whose hint shows live counters instead of static text
+_HINT_KEYS = _PICK_KEYS + ("screen", "annotate", "prepare", "train")
 
 
 def build_args() -> Namespace:
@@ -160,7 +165,108 @@ class App:
             return f"已保存: {roi.name}" if roi.is_file() else "未框选 - 点击打开框选窗口"
         if key == "pick_outdir":
             return str(self.args.infer_out)
+        name = Path(cfg["video"]).name
+        if key == "screen":
+            if not self.args.screening.is_file():
+                return "未筛选(点运行生成)"
+            rows = self._screening_rows(name)
+            if rows is None:
+                return "该视频无筛选记录"
+            return f"候选 {rows['candidates']} 帧,已排除 {rows['excluded']} 帧"
+        if key == "annotate":
+            rows = self._screening_rows(name)
+            labelled = self._labelled_count(name)
+            if rows is None and labelled is None:
+                return "未标注(需先 ②③)"
+            lab = str(labelled) if labelled is not None else "?"
+            if rows is not None and labelled is not None:
+                return f"已标注 {lab}/{rows['candidates']} 帧,剩 {rows['candidates'] - labelled} 待补充"
+            return f"已标注 {lab} 帧"
+        if key == "prepare":
+            images = self.args.dataset / "images"
+            n = len(list(images.glob("*.png"))) if images.is_dir() else 0
+            if not n:
+                return "未导出(点运行生成)"
+            nv = 0
+            dj = self.args.dataset / "dataset.json"
+            if dj.is_file():
+                try:
+                    nv = len(json.loads(dj.read_text(encoding="utf-8")).get("videos") or [])
+                except (json.JSONDecodeError, OSError):
+                    nv = 0
+            return f"数据集 {n} 对图像/掩码,{nv} 个视频(含背景缓存)"
+        if key == "train":
+            if not self.args.model.is_file():
+                return "未训练(点运行开始)"
+            tj = self.args.model.parent / "training_history.json"
+            if tj.is_file():
+                try:
+                    d = json.loads(tj.read_text(encoding="utf-8"))
+                    bg = "背景无关输入" if d.get("bg_subtract") else "raw 输入"
+                    return f"best_unet.pt Dice {100 * d['best_val_dice']:.1f}% ({bg})"
+                except (json.JSONDecodeError, OSError, KeyError):
+                    pass
+            return "best_unet.pt 已存在"
         return ""
+
+    def _screening_rows(self, video_name: str) -> dict | None:
+        """candidates / excluded counts for one video from screening.csv."""
+        if not self.args.screening.is_file():
+            return None
+        df = pd.read_csv(self.args.screening)
+        rows = df.loc[df.video == video_name]
+        if not len(rows):
+            return None
+        excluded = int(rows.exclude.fillna(False).astype(bool).sum())
+        return {"candidates": int(len(rows)) - excluded, "excluded": excluded}
+
+    def _labelled_count(self, video_name: str) -> int | None:
+        if not self.args.labels.is_file():
+            return None
+        lab = pd.read_csv(self.args.labels)
+        if "video" in lab:
+            lab = lab.loc[lab.video == video_name]
+        if "polygon_px" in lab:
+            lab = lab.loc[lab.polygon_px.notna() & (lab.polygon_px.astype(str).str.strip() != "")]
+        return int(len(lab))
+
+    def annotate_stats(self) -> None:
+        """Per-video annotation status dialog (check / supplement labels)."""
+        win = tk.Toplevel(self.root)
+        win.title("标注统计 - 检查 / 补充标注")
+        win.geometry("820x430")
+        cols = ("video", "cand", "lab", "rem", "excl", "bg")
+        heads = {"video": "视频", "cand": "筛选候选", "lab": "已标注",
+                 "rem": "待补充", "excl": "已排除", "bg": "背景缓存"}
+        tree = ttk.Treeview(win, columns=cols, show="headings")
+        for c in cols:
+            tree.heading(c, text=heads[c])
+            tree.column(c, width=90 if c == "video" else 76,
+                        anchor="w" if c == "video" else "center")
+        tot = {"cand": 0, "lab": 0, "excl": 0, "bg": 0}
+        for cfg in self.videos:
+            name = Path(cfg["video"]).name
+            rows = self._screening_rows(name)
+            labelled = self._labelled_count(name)
+            cand = rows["candidates"] if rows else 0
+            lab = labelled if labelled is not None else 0
+            rem = max(cand - lab, 0)
+            excl = rows["excluded"] if rows else 0
+            stem = Path(cfg["video"]).stem.replace(" ", "_")
+            has_bg = (self.args.dataset / "backgrounds" / f"{stem}.png").is_file()
+            tree.insert("", "end", values=(name, cand, lab, rem, excl, "✓" if has_bg else ""))
+            for k, v in (("cand", cand), ("lab", lab), ("excl", excl)):
+                tot[k] += v
+            tot["bg"] += 1 if has_bg else 0
+        tree.insert("", "end", values=("合计", tot["cand"], tot["lab"],
+                                       max(tot["cand"] - tot["lab"], 0),
+                                       tot["excl"], f"{tot['bg']}/{len(self.videos)}"))
+        tree.pack(fill="both", expand=True, padx=8, pady=(8, 2))
+        note = ttk.Label(win, font=("Microsoft YaHei UI", 9), foreground="#666666",
+                         text="运行 ④ 多边形标注 只会打开未标注的帧,已标注的自动跳过,"
+                              "可以随时点运行补充新标注。")
+        note.pack(padx=8, pady=(0, 4))
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
 
     def refresh(self) -> None:
         # cache status_of per refresh: dependencies re-query the same keys
@@ -178,7 +284,7 @@ class App:
             label, badge, hint_label = self.step_rows[key]
             label.config(text=title)
             badge.config(text=STATE_TEXT[state], fg=STATE_COLOR[state])
-            hint_label.config(text=self._dynamic_hint(key) if key in _PICK_KEYS else hint)
+            hint_label.config(text=self._dynamic_hint(key) if key in _HINT_KEYS else hint)
         self.root.update_idletasks()
 
     # -------------------------------------------------------- commands ---
@@ -394,6 +500,12 @@ class App:
 
         for spec in TRAIN_STEPS:
             self._step_row(tab_train, *spec)
+        stat_row = ttk.Frame(tab_train)
+        stat_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(stat_row, text="标注统计(检查/补充)",
+                   command=self.annotate_stats).pack(side="left")
+        ttk.Label(stat_row, text="已标注的帧不会重复标注,可随时再点 ④ 补充新的",
+                  font=("Microsoft YaHei UI", 9), foreground="#666666").pack(side="left", padx=8)
         ttk.Separator(tab_train).pack(fill="x", pady=6)
         for spec in PROC_STEPS:
             self._step_row(tab_proc, *spec)

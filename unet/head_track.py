@@ -31,6 +31,7 @@ from mouse_behavior_pipeline import (  # noqa: E402
     perspective_geometry, rectified_to_cm, robust_threshold, sample_frames, video_properties,
 )
 from model import UNet  # noqa: E402
+from preprocess import estimate_background, bg_centered  # noqa: E402
 
 
 def rot_pt(p: tuple[float, float], k: int, h: int, w: int) -> tuple[float, float]:
@@ -99,6 +100,23 @@ def main() -> None:
         # Arena turned by a quarter-turn: rotate the frame for the CNN and
         # rotate the ROI corners the same way so perspective stays aligned.
         corners = np.asarray([rot_pt(tuple(c), k, h, w) for c in corners], np.float32)
+
+    # Background-invariant CNN input, identical to train.py: active only
+    # when the model was trained with it (old checkpoints keep raw frames).
+    # This is a source-space background (the CNN never sees the rectified
+    # one below, which serves the reflection tracker).
+    bg_small = None
+    if bool(pack.get("bg_subtract")):
+        bg = estimate_background(Path(a.video))
+        if bg is not None:
+            bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
+            if k:
+                bg_gray = np.rot90(bg_gray, k)  # same rotation as the frames
+            bg_small = cv2.resize(bg_gray, (size, size), interpolation=cv2.INTER_AREA)
+            print(f"Model trained with background subtraction - applying "
+                  f"background-centered input (gain {pack.get('bg_gain', 2.0):.1f})")
+        else:
+            print("WARNING: background estimation failed; using raw frames")
     total, fps, _, _ = video_properties(Path(a.video))
     rw, rh, forward, inverse, _, _ = perspective_geometry(corners, a.arena_width_cm, a.arena_height_cm)
     _, samples = sample_frames(Path(a.video), total, 61)
@@ -143,6 +161,8 @@ def main() -> None:
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (size, size))
+            if bg_small is not None:
+                small = bg_centered(small, bg_small)
             x = torch.from_numpy(small[None, None].copy()).float().to(dev) / 255
             with torch.no_grad():
                 prob = torch.sigmoid(net(x))[0, 0].cpu().numpy()
@@ -189,6 +209,7 @@ def main() -> None:
     df.to_csv(out / "head_track_trajectory.csv", index=False, float_format="%.5f")
     (out / "head_track_metadata.json").write_text(json.dumps(
         {"device": dev, "frames": i, "threshold": a.threshold, "rotate": a.rotate,
+         "bg_subtract": bg_small is not None,
          "floor_bounds": list(floor) if floor is not None else None, "model_size": size,
          "head_valid_percent": round(100 * float(df.head_x_cm.notna().mean()), 2),
          "excluded_frames": sorted(excluded & set(range(i)))}, indent=2), encoding="utf-8")
