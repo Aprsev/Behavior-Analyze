@@ -3,14 +3,15 @@
 
 Two modes (notebook tabs):
   Training:   roi -> compare -> screen -> annotate -> prepare -> train
-  Processing: infer -> head
+  Processing: 5-step wizard for a new video:
+              ① pick video -> ② ROI box -> ③ output folder -> ④ infer -> ⑤ head
 Every step launches exactly the same command the CLI launcher would run, in
 a background thread, streaming output to the log pane. Step state is read
 from the artifacts on disk (ROI JSON, comparison.csv, screening.csv,
-labels, dataset, model, trajectory CSVs); a video picker plus an
-"apply to all videos" toggle control whether loop steps run on one or on
-every recording. New videos can be added from the UI and get their ROI
-through the corner picker automatically.
+labels, dataset, model, trajectory CSVs); an "apply to all videos" toggle
+controls whether loop steps run on one or on every recording. New videos
+are added through step ① and get their ROI through the corner picker
+automatically (step ②, or opened right after picking a new video).
 
 Run: python unet/run_unet.py ui
 """
@@ -47,9 +48,14 @@ TRAIN_STEPS = [
     ("prepare",  "⑤ 数据集导出",   "生成 images/masks(需 ④)"),
     ("train",    "⑥ 模型训练",     "训练 U-Net(需 ⑤)"),
 ]
+# Processing tab is a guided wizard for a NEW video: pick the file, box the
+# arena, choose where to save, then run the two processing steps.
 PROC_STEPS = [
-    ("infer", "① 分割推理",      "全帧 UNet 分割 -> mask/overlay"),
-    ("head",  "② 头+身体跟踪",   "mask 质心 + 反光点头部(需 ①)"),
+    ("pick_video",  "① 选择视频",     "当前视频名(点击更换)"),
+    ("pick_roi",    "② 区域框选",     "点击竞技场 4 角(A 自动吸附,S 保存)"),
+    ("pick_outdir", "③ 保存文件夹",   "输出目录:轨迹 CSV / 视频 / 模型记录"),
+    ("infer",       "④ 分割推理",     "全帧 UNet 分割 -> mask/overlay"),
+    ("head",        "⑤ 头+身体跟踪",  "mask 质心 + 反光点头部(需 ④)"),
 ]
 DEPENDENCIES = {
     "annotate": ("compare", "screen"),
@@ -59,6 +65,7 @@ DEPENDENCIES = {
 }
 STATE_TEXT = {DONE: "✓ 完成", READY: "○ 待运行", WARN: "△ 依赖缺失"}
 STATE_COLOR = {DONE: "#1a7f37", READY: "#0b57d0", WARN: "#b06000"}
+_PICK_KEYS = ("pick_video", "pick_roi", "pick_outdir")
 
 
 def build_args() -> Namespace:
@@ -84,7 +91,7 @@ class App:
         self.rotate_var = tk.IntVar(value=0)
         self.video_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
-        self.step_rows: dict[str, tuple[tk.Label, tk.Label]] = {}
+        self.step_rows: dict[str, tuple[tk.Label, tk.Label, ttk.Label]] = {}
         self._build_ui()
         self._fill_video_combo()
         self._start_log_pump()
@@ -134,9 +141,26 @@ class App:
             ok = (self.args.infer_out / "unet_trajectory.csv").is_file()
         elif key == "head":
             ok = (self.args.infer_out / "head_track_trajectory.csv").is_file()
+        elif key == "pick_video":
+            ok = True  # a video is always selected
+        elif key == "pick_roi":
+            ok = self.roi_path(cfg).is_file()
+        elif key == "pick_outdir":
+            ok = self.args.infer_out.is_dir()
         else:
             ok = False
         return DONE if ok else READY
+
+    def _dynamic_hint(self, key: str) -> str:
+        cfg = self.current_cfg()
+        if key == "pick_video":
+            return str(cfg["video"])
+        if key == "pick_roi":
+            roi = self.roi_path(cfg)
+            return f"已保存: {roi.name}" if roi.is_file() else "未框选 - 点击打开框选窗口"
+        if key == "pick_outdir":
+            return str(self.args.infer_out)
+        return ""
 
     def refresh(self) -> None:
         # cache status_of per refresh: dependencies re-query the same keys
@@ -151,9 +175,10 @@ class App:
             state = st(key)
             if state == READY and any(st(d) != DONE for d in DEPENDENCIES.get(key, ())):
                 state = WARN
-            label, badge = self.step_rows[key]
+            label, badge, hint_label = self.step_rows[key]
             label.config(text=title)
             badge.config(text=STATE_TEXT[state], fg=STATE_COLOR[state])
+            hint_label.config(text=self._dynamic_hint(key) if key in _PICK_KEYS else hint)
         self.root.update_idletasks()
 
     # -------------------------------------------------------- commands ---
@@ -255,7 +280,52 @@ class App:
             self.proc.terminate()
             self.log("\n--- 已请求停止 ---\n")
 
+    def pick_video(self) -> None:
+        f = filedialog.askopenfilename(
+            title="选择要处理的视频", initialdir=str(R.ROOT / "data"),
+            filetypes=[("视频", "*.avi *.mp4 *.mov *.mkv")])
+        if not f:
+            return
+        v = Path(f)
+        for idx, cfg in enumerate(self.videos):
+            if Path(cfg["video"]) == v:
+                self.current = idx
+                self._fill_video_combo()
+                self.refresh()
+                return
+        self.videos.append({"video": v, "roi": "", "compare_out": ""})
+        self.current = len(self.videos) - 1
+        self._fill_video_combo()
+        self.refresh()
+        if not self.roi_path(self.current_cfg()).is_file():
+            self.status_var.set("新视频缺少区域框选,自动打开框选窗口 ...")
+            self.run_scripts([R.roi_cmd(self.current_cfg())])
+
+    def pick_roi(self) -> None:
+        cfg = self.current_cfg()
+        roi = self.roi_path(cfg)
+        if roi.is_file() and not messagebox.askyesno(
+                "重新框选?", f"当前视频已有 ROI:\n{roi.name}\n\n重新框选?"):
+            return
+        self.status_var.set("区域框选 ...")
+        self.run_scripts([R.roi_cmd(cfg)])
+
+    def pick_outdir(self) -> None:
+        d = filedialog.askdirectory(title="选择输出文件夹", initialdir=str(self.args.infer_out))
+        if d:
+            self.args.infer_out = Path(d)
+            self.refresh()
+
     def run_step(self, key: str) -> None:
+        if key == "pick_video":
+            self.pick_video()
+            return
+        if key == "pick_roi":
+            self.pick_roi()
+            return
+        if key == "pick_outdir":
+            self.pick_outdir()
+            return
         if self.proc is not None and self.proc.poll() is None:
             messagebox.showwarning("任务运行中", "当前任务尚未结束，请先停止或等待完成。")
             return
@@ -280,21 +350,6 @@ class App:
             return
         self.run_scripts(self.commands_for("head"))
 
-    def add_video(self) -> None:
-        f = filedialog.askopenfilename(
-            title="选择新视频", initialdir=str(R.ROOT / "data"),
-            filetypes=[("视频", "*.avi *.mp4 *.mov *.mkv")])
-        if not f:
-            return
-        cfg = {"video": Path(f), "roi": "", "compare_out": ""}
-        self.videos.append(cfg)
-        self.current = len(self.videos) - 1
-        self._fill_video_combo()
-        self.refresh()
-        if not self.roi_path(cfg).is_file():
-            self.status_var.set("新视频缺少 ROI,自动打开四角标注 ...")
-            self.run_scripts([R.roi_cmd(cfg)])
-
     # -------------------------------------------------------------- ui ---
     def _fill_video_combo(self) -> None:
         names = [Path(c["video"]).name for c in self.videos]
@@ -313,15 +368,16 @@ class App:
         row.pack(fill="x", pady=3)
         label = ttk.Label(row, text=title, font=FONT, width=18, anchor="w")
         label.pack(side="left")
-        ttk.Label(row, text=hint, font=("Microsoft YaHei UI", 9),
-                  foreground="#666666", width=38, anchor="w").pack(side="left")
+        hint_label = ttk.Label(row, text=hint, font=("Microsoft YaHei UI", 9),
+                               foreground="#666666", anchor="w")
+        hint_label.pack(side="left", fill="x", expand=True)
         badge = tk.Label(row, text="○ 待运行", font=FONT, width=10,
                          anchor="center",
                          bg=ttk.Style().lookup("TFrame", "background"))
         badge.pack(side="right", padx=(4, 0))
         ttk.Button(row, text="运行", width=8,
                    command=lambda k=key: self.run_step(k)).pack(side="right", padx=4)
-        self.step_rows[key] = (label, badge)
+        self.step_rows[key] = (label, badge, hint_label)
 
     def _build_ui(self) -> None:
         root = self.root
@@ -358,7 +414,6 @@ class App:
                                         state="readonly", width=52, font=FONT)
         self.video_combo.pack(side="left", padx=4)
         self.video_combo.bind("<<ComboboxSelected>>", self._on_video_change)
-        ttk.Button(bar, text="添加新视频", command=self.add_video).pack(side="left", padx=4)
         ttk.Checkbutton(bar, text="循环步骤应用到全部视频", variable=self.all_var,
                         command=self.refresh).pack(side="left", padx=10)
         ttk.Button(bar, text="刷新状态", command=self.refresh).pack(side="right", padx=4)
