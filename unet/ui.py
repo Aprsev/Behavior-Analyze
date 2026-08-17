@@ -81,7 +81,7 @@ def build_args() -> Namespace:
         screening=R.SCREENING, labels=R.LABELS, heads=R.HEADS, dataset=R.DATASET,
         model=R.MODEL, infer_out=R.INFER_OUT,
         arena_width_cm=R.ARENA_WIDTH_CM, arena_height_cm=R.ARENA_HEIGHT_CM,
-        max_labels=100, per_video=40, junk=20, size=256,
+        max_labels=10, per_video=10, junk=20, size=256,
         epochs=80, batch_size=8, lr=2e-3, calib_frames=20,
         threshold=0.5, rotate=0,
     )
@@ -102,6 +102,7 @@ class App:
         self.status_var = tk.StringVar(value="就绪")
         self.epochs_var = tk.StringVar(value=str(self.args.epochs))
         self.lr_var = tk.StringVar(value=f"{self.args.lr:g}")
+        self.per_video_var = tk.StringVar(value=str(self.args.per_video))
         self.step_rows: dict[str, tuple[tk.Label, tk.Label, ttk.Label]] = {}
         # live training curve: epoch -> (train_loss, val_dice)
         self.train_curve: dict[int, tuple[float, float]] = {}
@@ -344,6 +345,15 @@ class App:
         w = f"{self.args.arena_width_cm:.2f}"
         h = f"{self.args.arena_height_cm:.2f}"
         self.args.rotate = int(self.rotate_var.get())
+        # UI-settable screening budget: frames picked per video (③) and
+        # newly labelled per annotate run (④). A low budget (default 10)
+        # keeps the manual work small: the picker spreads them across the
+        # whole recording so near-duplicate frames are not selected.
+        try:
+            self.args.per_video = max(1, min(200, int(self.per_video_var.get())))
+            self.args.max_labels = self.args.per_video
+        except (ValueError, tk.TclError):
+            pass
         loop = self.all_var.get() and key in LOOP_STEPS
         cfgs = [self.local_cfg(c) for c in self.videos] if loop else [self.local_cfg(self.current_cfg())]
         if key == "roi":
@@ -693,6 +703,9 @@ class App:
                     width=6, font=FONT).pack(side="left")
         ttk.Label(set_row, text="学习率", font=FONT).pack(side="left", padx=(8, 2))
         ttk.Entry(set_row, textvariable=self.lr_var, width=8, font=FONT).pack(side="left")
+        ttk.Label(set_row, text="每视频标注帧数", font=FONT).pack(side="left", padx=(8, 2))
+        ttk.Spinbox(set_row, from_=1, to=100, textvariable=self.per_video_var,
+                    width=4, font=FONT).pack(side="left")
         ttk.Label(set_row, text="(batch 固定 8; ⑦ 校准帧数 20)",
                   font=("Microsoft YaHei UI", 9), foreground="#666666").pack(side="left", padx=8)
         self.curve_cv = tk.Canvas(tab_train, height=170, bg="#fbfbfb",

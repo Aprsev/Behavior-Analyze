@@ -244,8 +244,10 @@ def main() -> None:
     p.add_argument("--infer-out", type=Path, dest="infer_out", default=INFER_OUT)
     p.add_argument("--arena-width-cm", type=float, default=ARENA_WIDTH_CM)
     p.add_argument("--arena-height-cm", type=float, default=ARENA_HEIGHT_CM)
-    p.add_argument("--max-labels", type=int, default=100)
-    p.add_argument("--per-video", type=int, default=40, help="screened candidates per video")
+    p.add_argument("--max-labels", type=int, default=10,
+                   help="new frames labelled per video per annotate run")
+    p.add_argument("--per-video", type=int, default=10,
+                   help="screened candidates per video (default 10; they are spread across the whole recording)")
     p.add_argument("--junk", type=int, default=20, help="junk frames shown per video")
     p.add_argument("--size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=80)

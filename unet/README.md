@@ -40,9 +40,11 @@ python unet/run_unet.py check
 # 2. (re)generate head_method_comparison.csv for every video (needed by annotator)
 python unet/run_unet.py compare
 
-# 3. Screen frames: farthest-point sampling picks the most different frames of
-#    every video; a montage lets you exclude junk (mouse absent, human
-#    intervention, motion blur). Junk is auto-flagged and shown last.
+# 3. Screen frames: 10 frames per video (default; adjustable), spread
+#    across the whole recording - the video is divided into 10 equal time
+#    bins and the most distinct frame of each bin is kept, so no cluster
+#    of near-duplicate frames appears. A montage lets you exclude junk
+#    (mouse absent, human intervention, motion blur), auto-flagged last.
 python unet/run_unet.py screen
 
 # 4. Annotate torso polygons for the screened frames of each video
@@ -94,10 +96,16 @@ python unet/run_unet.py head
 ### Frame selection and screening
 
 - The old low-confidence + uniform picking produced many near-identical
-  frames. `scan_candidates` now scans the whole video, keeps frames with a
-  plausible automatic mouse segmentation, and `farthest_pick` greedily picks
-  the frames whose normalized arena appearance (position, posture) differs
-  most from everything already picked.
+  frames. `scan_candidates` scans the whole video and keeps frames with a
+  plausible automatic mouse segmentation; `farthest_pick_binned` then
+  divides the recording into `--per-video` equal time bins (default **10**)
+  and takes the frame whose normalized arena appearance (position, posture)
+  differs most from everything already picked **in each bin**. The 10
+  candidates therefore span the entire recording and never cluster in one
+  quiet/active period, which removes the near-duplicate frames.
+- The GUI exposes the budget as "每视频标注帧数" (③ screening and ④
+  annotate use it; default 10). The annotator never shows more than this
+  many *new* frames per video per run.
 - `unet/screen_frames.py` shows the picked frames as 3x3 montage pages
   (click to toggle EXCLUDED, `n`/`p` pages, `s` save, `q` quit). Frames where
   the automatic segmentation failed — mouse absent, human intervention,
@@ -168,7 +176,7 @@ background cache).
 
 ```powershell
 # Screen one video
-python unet/screen_frames.py --video "data/video.avi" --roi "traditional/basic_rois/video_roi.json" --output "traditional/results/screening.csv" --per-video 40 --junk 20
+python unet/screen_frames.py --video "data/video.avi" --roi "traditional/basic_rois/video_roi.json" --output "traditional/results/screening.csv" --per-video 10 --junk 20
 
 # Annotate using the screened candidates
 python traditional/annotate_torso_constraints.py --input "data/video.avi" --comparison-csv "traditional/results/basic_recognition/video/head_method_comparison.csv" --roi-json "traditional/basic_rois/video_roi.json" --output "traditional/results/manual_torso_constraints.csv" --arena-width-cm 25 --arena-height-cm 30 --candidate-csv "traditional/results/screening.csv"

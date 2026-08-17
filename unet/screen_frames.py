@@ -6,7 +6,10 @@ For every input video this tool:
   2. scans a uniform grid and splits frames into "good" (plausible mouse
      segmentation) and "junk" (segmentation failed, mouse absent, human
      intervention, motion blur, ...);
-  3. farthest-point samples --per-video maximally different good frames;
+  3. picks --per-video good frames (default 10) spread across the whole
+     video: the recording is divided into --per-video equal time bins and
+     the most content-distinct frame of each bin is taken, so the selection
+     never clusters near-duplicate frames in one time period;
   4. appends up to --junk junk frames, pre-excluded;
   5. shows a 3x3 montage: click a cell to toggle EXCLUDED (red border);
      junk frames start excluded and can be re-included if wrongly flagged.
@@ -31,7 +34,7 @@ import pandas as pd
 
 CODE = Path(__file__).resolve().parents[1] / "traditional" / "code"
 sys.path.insert(0, str(CODE))
-from annotate_torso_constraints import farthest_pick, scan_candidates  # noqa: E402
+from annotate_torso_constraints import scan_candidates  # noqa: E402
 from mouse_behavior_pipeline import (  # noqa: E402
     perspective_geometry, robust_threshold, sample_frames, video_properties,
 )
@@ -110,6 +113,35 @@ def montage_session(cap: cv2.VideoCapture, items: list[dict], video_name: str) -
     return excluded
 
 
+def farthest_pick_binned(descriptors: np.ndarray, count: int) -> list[int]:
+    """Pick `count` frames spread across the whole recording.
+
+    The good candidates (in frame order) are divided into `count` equal
+    time bins and one frame per bin is chosen: the first bin takes its
+    first frame, every later bin takes the frame whose descriptor is
+    farthest from everything already picked. This guarantees full temporal
+    coverage (no near-duplicate clusters) while still preferring the most
+    distinct posture per period.
+    """
+    n = len(descriptors)
+    if n <= count:
+        return list(range(n))
+    picked_desc: list[np.ndarray] = []
+    out: list[int] = []
+    for i in range(count):
+        lo = n * i // count
+        hi = n * (i + 1) // count
+        if not picked_desc:
+            j = 0
+        else:
+            d = np.min(np.linalg.norm(descriptors[lo:hi, None, :] - np.stack(picked_desc)[None, :, :],
+                                      axis=2), axis=1)
+            j = int(d.argmax())
+        out.append(lo + j)
+        picked_desc.append(descriptors[lo + j])
+    return out
+
+
 def save_rows(output: Path, rows: list[dict]) -> None:
     df = pd.DataFrame(rows, columns=["video", "frame", "exclude"])
     if output.exists():
@@ -125,7 +157,7 @@ def main() -> None:
     p.add_argument("--video", action="append", required=True, help="source video (repeatable)")
     p.add_argument("--roi", action="append", required=True, help="ROI JSON (repeatable, one per video)")
     p.add_argument("--output", default=str(Path(__file__).resolve().parents[1] / "traditional" / "results" / "screening.csv"))
-    p.add_argument("--per-video", type=int, default=40, help="diverse candidates to label per video")
+    p.add_argument("--per-video", type=int, default=10, help="diverse candidates to label per video")
     p.add_argument("--junk", type=int, default=20, help="junk frames shown per video (pre-excluded)")
     p.add_argument("--arena-width-cm", type=float, default=25.0)
     p.add_argument("--arena-height-cm", type=float, default=30.0)
@@ -152,7 +184,7 @@ def main() -> None:
         # short "mouse absent / hand intervention" segments are not missed.
         good, junk = scan_candidates(cap, total, forward, rw, rh, background, threshold,
                                      pool_cap=4000, excluded=set(), suspicious_area=0.3)
-        picks = farthest_pick(np.stack([d for _, d, _ in good]), a.per_video)
+        picks = farthest_pick_binned(np.stack([d for _, d, _ in good]), a.per_video)
         items = []
         for i in picks:
             f, _, contour = good[i]
