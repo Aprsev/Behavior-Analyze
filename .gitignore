@@ -17,3 +17,6 @@ trajectory.csv
 pipeline_log.txt
 arena_calibration_preview.png
 median_background.png
+
+# GUI state
+unet/.ui_videos.json

@@ -57,11 +57,25 @@ def main() -> None:
         if all(np.hypot(x - px, y - py) > a.min_dist for px, py in pts):
             pts.append((int(x), int(y)))
 
+    def save_roi() -> None:
+        payload = {
+            "input": str(video),
+            "arena_corners_px": [[float(x), float(y)] for x, y in pts],
+            "selection_mode": "manual_four_corner_perspective",
+        }
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Saved ROI JSON: {out}")
+        print("Next: python unet/run_unet.py compare/screen/... (edit VIDEOS in run_unet.py, or use --interactive)")
+
     cv2.namedWindow(title, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(title, on_mouse)
     while True:
         if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
-            print("Window closed without saving.")
+            if len(pts) == 4:
+                save_roi()  # X close with 4 corners = save, not discard
+            else:
+                print("Window closed without saving (need 4 corners).")
             return
         img = frame.copy()
         if len(pts) >= 2:
@@ -93,15 +107,7 @@ def main() -> None:
             if len(pts) != 4:
                 print(f"Need exactly 4 corners; only {len(pts)} clicked.")
                 continue
-            payload = {
-                "input": str(video),
-                "arena_corners_px": [[float(x), float(y)] for x, y in pts],
-                "selection_mode": "manual_four_corner_perspective",
-            }
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            print(f"Saved ROI JSON: {out}")
-            print("Next: python unet/run_unet.py compare/screen/... (edit VIDEOS in run_unet.py, or use --interactive)")
+            save_roi()
             return
     cv2.destroyAllWindows()
 

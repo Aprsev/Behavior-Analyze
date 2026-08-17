@@ -23,6 +23,10 @@ python -m pip install -r unet/requirements-gpu.txt
 
 # 0b. GUI wizard: two tabs (training / processing), one click per step,
 #     live logs, video picker, new-video ROI auto-pick. tkinter only.
+#     Training tab: epoch / learning-rate spinboxes and a live loss curve
+#     (one point per 5 epochs). The video list survives restarts
+#     (unet/.ui_videos.json); closing an annotate/calibrate/ROI window with
+#     the X button SAVES instead of discarding the session's work.
 python unet/run_unet.py ui
 
 # 0b. NEW video, first time: click the 4 arena corners to make its ROI JSON
@@ -42,20 +46,28 @@ python unet/run_unet.py compare
 python unet/run_unet.py screen
 
 # 4. Annotate torso polygons for the screened frames of each video
-#    (external OpenCV window; frames already labelled are skipped)
+#    (external OpenCV window; ~8 points per mouse are enough, press T to
+#    thin any automatic contour to 8; already labelled frames are skipped)
 python unet/run_unet.py annotate
 
 # 5. Export all videos into one dataset (excluded frames are dropped;
 #    image names are prefixed per video so nothing collides)
 python unet/run_unet.py prepare
 
-# 6. Train on the combined dataset
+# 6. Train on the combined dataset (epochs / learning rate in the GUI;
+#    live loss curve is drawn while training runs)
 python unet/run_unet.py train
 
-# 7. Predict a new video; excluded frames become NaN + EXCLUDED overlay
+# 7. Manual model calibration: 20 least-confident frames (sorted by mean
+#    |p-0.5| inside the predicted mask) open in one window where you can
+#    correct the polygon contour + head point + reflection point. Saving
+#    automatically re-exports the dataset and retrains.
+python unet/run_unet.py calibrate
+
+# 8. Predict a new video; excluded frames become NaN + EXCLUDED overlay
 python unet/run_unet.py infer
 
-# 8. Combined body + head tracking: U-Net mask centroid (body) +
+# 9. Combined body + head tracking: U-Net mask centroid (body) +
 #    miniscope reflection inside the clean mask (head)
 python unet/run_unet.py head
 ```
@@ -126,6 +138,31 @@ One-time migration after pulling: rerun `prepare` (⑤) once so every video
 gets its background cache, then `train` (⑥). Training only enables the
 transform when **every** video in the dataset has a cache; a mixed dataset
 falls back to raw frames with a warning.
+
+### Manual model calibration (step ⑦)
+
+After training, the model's weak spots are usually a handful of hard frames.
+`unet/calibrate_model.py` finds them and lets you correct them by hand:
+
+1. scores every frame of the video with the trained model; the uncertainty
+   score is the mean `|p-0.5|` **inside the predicted mask** (background
+   pixels are confidently 0 and would drown the metric otherwise);
+2. keeps only plausible masks (0.1%-20% of the frame) and picks the
+   `--n-frames` (default 20) **lowest-scoring** frames — the least confident;
+3. opens them in one window sorted by confidence, where you can drag the
+   polygon vertices (or click an edge to insert), drag the **HEAD** dot
+   (red, initialized from `head_method_comparison.csv`) and the
+   **REFLECTION** dot (magenta) — per-frame `v`/`x` mark the head/reflection
+   as absent;
+4. `s` saves, `q`/`Esc`/window-X saves and exits, `r` restores the model's
+   polygon, `t` thins to 8 points, `e` excludes the frame from training.
+
+Corrections are upserted per (video, frame) into `manual_torso_constraints.csv`
+and `head_anchor_calibration.csv`. Exiting with corrections saved makes
+`run_unet.py calibrate` re-export the dataset and retrain automatically
+(`exit 0` = saved; nothing saved = skip retrain). The GUI shows the
+annotation statistics per video (screened / labelled / remaining / excluded /
+background cache).
 
 ## Direct commands (without the launcher)
 

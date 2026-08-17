@@ -26,7 +26,7 @@ from mouse_behavior_pipeline import (
 )
 
 
-def simplify(points: np.ndarray, count: int = 16) -> np.ndarray:
+def simplify(points: np.ndarray, count: int = 8) -> np.ndarray:
     if len(points) <= count: return points.astype(float)
     return points[np.linspace(0, len(points)-1, count, dtype=int)].astype(float)
 
@@ -172,6 +172,9 @@ def main() -> None:
     if not frames:
         print('No new frames to label: all screened candidates are already labelled.')
         cap.release(); return
+    print(f'{Path(args.input).name}: {len(labels)} frames already labelled, '
+          f'{len(frames)} NEW unlabelled frames to label (max {args.max_labels} per run) - '
+          f'previously labelled frames are never shown again.')
     state={'i':0,'points':None,'drag':None}
     def frame_image(frame):
         cap.set(cv2.CAP_PROP_POS_FRAMES,frame); ok,img=cap.read()
@@ -185,7 +188,7 @@ def main() -> None:
         detection=segment_mouse(rectified,background,threshold,None,float('inf'),None)
         if detection.contour is not None:
             source_contour=cv2.perspectiveTransform(detection.contour.astype(np.float32),inverse)[:,0,:]
-            return simplify(source_contour,16)
+            return simplify(source_contour,8)
         row=data.loc[data.frame==frame].iloc[0]
         # Fallback only when automatic segmentation failed entirely.
         cx,cy=row.body_x_cm/args.arena_width_cm*(rw-1),row.body_y_cm/args.arena_height_cm*(rh-1)
@@ -194,7 +197,7 @@ def main() -> None:
             if np.isfinite([x,y]).all(): pts.append((x/args.arena_width_cm*(rw-1),y/args.arena_height_cm*(rh-1)))
         radius=max([12]+[np.hypot(x-cx,y-cy) for x,y in pts]) + 11
         ellipse=cv2.ellipse2Poly((int(cx),int(cy)),(int(radius),int(max(9,radius*.65))),0,0,360,20).astype(np.float32)
-        return cv2.perspectiveTransform(ellipse[None],inverse)[0]
+        return simplify(cv2.perspectiveTransform(ellipse[None],inverse)[0], 8)
     def load():
         frame=frames[state['i']]; row=labels.get(frame)
         if row is not None and isinstance(row.polygon_px,str) and row.polygon_px:
@@ -236,6 +239,12 @@ def main() -> None:
         merge_annotation_exclusions(args.candidate_csv, Path(args.input).name, rows)
     cv2.namedWindow(title,cv2.WINDOW_NORMAL); cv2.setMouseCallback(title,mouse); load()
     while True:
+        # Closing the window with X must SAVE, not discard: otherwise the
+        # whole session's labels exist only in memory and reappear as
+        # "unlabelled" on the next run (the classic re-annotate bug).
+        if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+            save(); print('Window closed - annotations saved.')
+            break
         frame=frames[state['i']]; img=frame_image(frame); pts=state['points'].astype(np.int32)
         cv2.polylines(img,[pts],True,(255,255,0),2,cv2.LINE_AA)
         for x,y in pts: cv2.circle(img,(x,y),4,(255,255,0),-1,cv2.LINE_AA)
@@ -243,7 +252,7 @@ def main() -> None:
         excluded_flag = bool(labels.get(frame) is not None and bool(labels[frame].exclude))
         status = ' [EXCLUDED]' if excluded_flag else ''
         cv2.putText(img,f'{state["i"]+1}/{len(frames)} frame={frame}{status}: automatic body contour; adjust only fibre/tail-affected vertices',(8,19),cv2.FONT_HERSHEY_SIMPLEX,.43,(0,0,255) if excluded_flag else (255,255,255),1)
-        cv2.putText(img,'Drag vertex / click edge add  Backspace delete  R recalc auto  E discard  A/D step  S save  Q quit',(8,39),cv2.FONT_HERSHEY_SIMPLEX,.37,(255,255,255),1)
+        cv2.putText(img,'Drag vertex / click edge add  Backspace delete  R recalc  T thin(8pts)  E discard  A/D step  S save  Q quit',(8,39),cv2.FONT_HERSHEY_SIMPLEX,.37,(255,255,255),1)
         cv2.imshow(title,img); k=cv2.waitKey(20)&255
         if k in (27,ord('q')): save(); break
         if k==ord('s'):
@@ -251,6 +260,7 @@ def main() -> None:
             if state['i'] < len(frames)-1:
                 state['i'] += 1; load()
         elif k==ord('r'): state['points']=auto_polygon(frame)
+        elif k==ord('t'): state['points']=simplify(np.asarray(state['points']),8)
         elif k in (8,127) and len(state['points'])>3:
             idx,_=nearest(*state['points'].mean(axis=0)); state['points']=np.delete(state['points'],idx,axis=0)
         elif k in (ord('e'),ord('E')):

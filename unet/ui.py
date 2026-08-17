@@ -22,6 +22,7 @@ import json
 import subprocess
 import sys
 import threading
+import time
 from argparse import Namespace
 from pathlib import Path
 
@@ -47,9 +48,10 @@ TRAIN_STEPS = [
     ("roi",      "① ROI 四角标注", "新视频:点竞技场 4 个角"),
     ("compare",  "② 生成对比数据", "生成 head_method_comparison.csv"),
     ("screen",   "③ 帧筛选",      "排除无鼠 / 实验者干预帧"),
-    ("annotate", "④ 多边形标注",   "修正身体轮廓(需 ②③)"),
+    ("annotate", "④ 多边形标注",   "约 8 个点描身体轮廓(需 ②③)"),
     ("prepare",  "⑤ 数据集导出",   "生成 images/masks(需 ④)"),
-    ("train",    "⑥ 模型训练",     "训练 U-Net(需 ⑤)"),
+    ("train",    "⑥ 模型训练",     "训练 U-Net(需 ⑤,实时 loss 曲线)"),
+    ("calibrate", "⑦ 校准并重训",  "20 个低置信度帧:多边形+反光点+头点"),
 ]
 # Processing tab is a guided wizard for a NEW video: pick the file, box the
 # arena, choose where to save, then run the two processing steps.
@@ -64,22 +66,24 @@ DEPENDENCIES = {
     "annotate": ("compare", "screen"),
     "prepare":  ("annotate",),
     "train":    ("prepare",),
+    "calibrate": ("train",),
     "head":     ("infer",),
 }
 STATE_TEXT = {DONE: "✓ 完成", READY: "○ 待运行", WARN: "△ 依赖缺失"}
 STATE_COLOR = {DONE: "#1a7f37", READY: "#0b57d0", WARN: "#b06000"}
 _PICK_KEYS = ("pick_video", "pick_roi", "pick_outdir")
 # training steps whose hint shows live counters instead of static text
-_HINT_KEYS = _PICK_KEYS + ("screen", "annotate", "prepare", "train")
+_HINT_KEYS = _PICK_KEYS + ("screen", "annotate", "prepare", "train", "calibrate")
 
 
 def build_args() -> Namespace:
     return Namespace(
-        screening=R.SCREENING, labels=R.LABELS, dataset=R.DATASET,
+        screening=R.SCREENING, labels=R.LABELS, heads=R.HEADS, dataset=R.DATASET,
         model=R.MODEL, infer_out=R.INFER_OUT,
         arena_width_cm=R.ARENA_WIDTH_CM, arena_height_cm=R.ARENA_HEIGHT_CM,
         max_labels=100, per_video=40, junk=20, size=256,
-        epochs=80, batch_size=8, threshold=0.5, rotate=0,
+        epochs=80, batch_size=8, lr=2e-3, calib_frames=20,
+        threshold=0.5, rotate=0,
     )
 
 
@@ -87,7 +91,7 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.args = build_args()
-        self.videos = [dict(c) for c in R.VIDEOS]
+        self.videos = self._load_videos()
         self.current = 0
         self.proc: subprocess.Popen | None = None
         self.log_q: deque[str] = deque(maxlen=LOG_QUEUE_MAX)  # drops oldest
@@ -96,13 +100,50 @@ class App:
         self.rotate_var = tk.IntVar(value=0)
         self.video_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
+        self.epochs_var = tk.StringVar(value=str(self.args.epochs))
+        self.lr_var = tk.StringVar(value=f"{self.args.lr:g}")
         self.step_rows: dict[str, tuple[tk.Label, tk.Label, ttk.Label]] = {}
+        # live training curve: epoch -> (train_loss, val_dice)
+        self.train_curve: dict[int, tuple[float, float]] = {}
+        self._curve_last_draw = 0.0
+        self._curve_pending = False
         self._build_ui()
         self._fill_video_combo()
         self._start_log_pump()
         self.refresh()
+        self.draw_curve()
 
     # ------------------------------------------------------------ paths ---
+    def _load_videos(self) -> list[dict]:
+        """Persisted video list (unet/.ui_videos.json) survives UI restarts;
+        videos added via step ① are not lost. Falls back to run_unet.VIDEOS."""
+        f = Path(__file__).resolve().parent / ".ui_videos.json"
+        if f.is_file():
+            try:
+                saved = json.loads(f.read_text(encoding="utf-8")).get("videos") or []
+                if saved:
+                    out = []
+                    for v in saved:
+                        if Path(v["video"]).is_file():
+                            out.append({"video": Path(v["video"]),
+                                        "roi": Path(v.get("roi") or ""),
+                                        "compare_out": Path(v.get("compare_out") or "")})
+                    if out:
+                        return out
+            except (json.JSONDecodeError, OSError, KeyError, TypeError):
+                pass
+        return [dict(c) for c in R.VIDEOS]
+
+    def _save_videos(self) -> None:
+        f = Path(__file__).resolve().parent / ".ui_videos.json"
+        try:
+            f.write_text(json.dumps(
+                {"videos": [{"video": str(v["video"]), "roi": str(v.get("roi") or ""),
+                             "compare_out": str(v.get("compare_out") or "")}
+                            for v in self.videos]}, indent=2), encoding="utf-8")
+        except OSError:
+            pass  # persistence is best-effort, never blocks the UI
+
     def current_cfg(self) -> dict:
         return self.videos[self.current]
 
@@ -123,7 +164,8 @@ class App:
     def make_v(self) -> dict:
         return {"video": self.current_cfg()["video"], "model": self.args.model,
                 "infer_out": self.args.infer_out, "dataset": self.args.dataset,
-                "labels": self.args.labels, "screening": self.args.screening}
+                "labels": self.args.labels, "screening": self.args.screening,
+                "heads": self.args.heads}
 
     # ----------------------------------------------------------- state ---
     def status_of(self, key: str) -> str:
@@ -142,6 +184,8 @@ class App:
             ok = images.is_dir() and any(images.glob("*.png"))
         elif key == "train":
             ok = self.args.model.is_file()
+        elif key == "calibrate":
+            ok = self.args.heads.is_file()
         elif key == "infer":
             ok = (self.args.infer_out / "unet_trajectory.csv").is_file()
         elif key == "head":
@@ -207,6 +251,14 @@ class App:
                 except (json.JSONDecodeError, OSError, KeyError):
                     pass
             return "best_unet.pt 已存在"
+        if key == "calibrate":
+            if not self.args.heads.is_file():
+                return "未校准 - 点运行:自动选 20 个低置信度帧"
+            try:
+                n = len(pd.read_csv(self.args.heads))
+            except (OSError, pd.errors.EmptyDataError):
+                n = 0
+            return f"已校准 {n} 条(可随时重跑,会自动重训)"
         return ""
 
     def _screening_rows(self, video_name: str) -> dict | None:
@@ -305,7 +357,28 @@ class App:
         if key == "prepare":
             return [R.prepare_cmd(c, w, h, self.args) for c in cfgs]
         if key == "train":
+            # UI-settable training settings (轮次 / 学习率)
+            try:
+                self.args.epochs = max(1, int(self.epochs_var.get()))
+            except (ValueError, tk.TclError):
+                pass
+            try:
+                self.args.lr = max(1e-6, float(self.lr_var.get()))
+            except (ValueError, tk.TclError):
+                pass
             return [R.train_cmd(self.make_v(), self.args)]
+        if key == "calibrate":
+            # ⑦ calibrate on the weakest frames -> on success re-export the
+            # corrected masks (all videos) -> retrain. The chain stops if
+            # nothing was saved (calibrate exits nonzero).
+            cfg = {"video": self.make_v()["video"], "roi": self.roi_path(self.current_cfg()),
+                   "compare_out": Path(self.current_cfg().get("compare_out") or
+                                       R.ROOT / "traditional" / "results" / "basic_recognition" / Path(self.current_cfg()["video"]).stem)}
+            cmds = [R.calibrate_cmd(self.make_v(), cfg, self.args)]
+            for c in [self.local_cfg(c) for c in self.videos]:
+                cmds.append(R.prepare_cmd(c, w, h, self.args))
+            cmds.append(R.train_cmd(self.make_v(), self.args))
+            return cmds
         if key == "infer":
             return [R.infer_cmd(self.make_v(), self.args)]
         if key == "head":
@@ -365,6 +438,7 @@ class App:
                     line = self.log_q.popleft()
                 except IndexError:  # another thread drained it meanwhile
                     break
+                self._on_log_line(line)
                 self.log_text.insert(tk.END, line)
                 self.log_lines += line.count("\n")
                 inserted += 1
@@ -373,6 +447,108 @@ class App:
                 self.log_text.see(tk.END)
             self.root.after(120, pump)
         self.root.after(120, pump)
+
+    def _on_log_line(self, line: str) -> None:
+        """train.py streams one JSON line per epoch -> feed the live curve."""
+        if "epoch" not in line or "train_loss" not in line:
+            return
+        try:
+            d = json.loads(line.strip())
+        except json.JSONDecodeError:
+            return
+        if isinstance(d, dict) and "epoch" in d and "train_loss" in d:
+            self.train_curve[int(d["epoch"])] = (float(d["train_loss"]),
+                                                 float(d.get("val_dice", float("nan"))))
+            self._schedule_curve_redraw()
+
+    def _schedule_curve_redraw(self) -> None:
+        now = time.monotonic()
+        if now - self._curve_last_draw >= 0.8:
+            self._curve_last_draw = now
+            self.draw_curve()
+        elif not self._curve_pending:
+            self._curve_pending = True
+            self.root.after(400, self._curve_flush)
+
+    def _curve_flush(self) -> None:
+        self._curve_pending = False
+        self._curve_last_draw = time.monotonic()
+        self.draw_curve()
+
+    # -------------------------------------------------- loss curve ---
+    def draw_curve(self) -> None:
+        """Live training curve, one point per 5 epochs (loss + val dice)."""
+        cv = self.curve_cv
+        cv.delete("all")
+        W = cv.winfo_width() or 880
+        H = cv.winfo_height() or 170
+        if not self.train_curve:
+            cv.create_text(W / 2, H / 2,
+                           text="训练 loss 曲线:运行 ⑥ 后实时显示(每 5 个 epoch 一个点)",
+                           fill="#888888", font=("Microsoft YaHei UI", 10))
+            return
+        epochs = sorted(self.train_curve)
+        # bucket = 5 epochs (average); the partial last bucket is kept so
+        # the curve extends while training is still running.
+        buckets: list[tuple[int, float, float]] = []
+        for b in range(5, epochs[-1] + 1, 5):
+            sel = [self.train_curve[e] for e in epochs if b - 4 <= e <= b]
+            if sel:
+                dices = [d for _, d in sel if d == d]  # drop NaN
+                buckets.append((b, sum(l for l, _ in sel) / len(sel),
+                                sum(dices) / len(dices) if dices else float("nan")))
+        tail = epochs[-1]
+        if tail % 5:
+            sel = [self.train_curve[e] for e in epochs if e > tail - tail % 5]
+            if sel:
+                dices = [d for _, d in sel if d == d]
+                buckets.append((tail, sum(l for l, _ in sel) / len(sel),
+                                sum(dices) / len(dices) if dices else float("nan")))
+        xs = [b[0] for b in buckets]
+        losses = [b[1] for b in buckets]
+        dices = [(b[0], b[2]) for b in buckets if b[2] == b[2]]
+        panel_h = (H - 12) // 2
+        self._chart_panel(cv, 6, 4, W - 8, 6 + panel_h, xs, losses,
+                          f"train loss (每 5 epoch 一点)  epoch {epochs[-1]}/{self.args.epochs}",
+                          "#0b57d0")
+        self._chart_panel(cv, 6, 10 + panel_h, W - 8, H - 4, [p[0] for p in dices],
+                          [p[1] for p in dices], "val dice", "#1a7f37")
+
+    def _chart_panel(self, cv: tk.Canvas, x0: int, y0: int, x1: int, y1: int,
+                     xs: list[int], values: list[float], label: str, color: str) -> None:
+        cv.create_rectangle(x0, y0, x1, y1, outline="#d0d0d0")
+        cv.create_text(x0 + 6, y0 + 4, anchor="nw", text=label,
+                       font=("Microsoft YaHei UI", 9), fill="#444444")
+        if len(values) < 1:
+            return
+        vmin, vmax = min(values), max(values)
+        if vmax - vmin < 1e-9:
+            vmax = vmin + 1.0
+        pad = (vmax - vmin) * 0.15
+        vmin, vmax = vmin - pad, vmax + pad
+        rng_x = max(xs[-1] - xs[0], 1)
+
+        def px(e: int) -> float:
+            return x0 + 10 + (e - xs[0]) / rng_x * (x1 - x0 - 20)
+
+        def py(v: float) -> float:
+            return y1 - 12 - (v - vmin) / (vmax - vmin) * (y1 - y0 - 42)
+
+        for f in (0.0, 0.5, 1.0):
+            v = vmin + f * (vmax - vmin)
+            gy = py(v)
+            cv.create_line(x0 + 8, gy, x1 - 8, gy, fill="#eeeeee")
+            cv.create_text(x0 + 4, gy, anchor="e", text=f"{v:.4g}",
+                           fill="#999999", font=("Consolas", 7))
+        step = max(1, rng_x // 4)
+        for e in range(xs[0], xs[-1] + 1, step):
+            cv.create_text(px(e), y1 - 4, anchor="n", text=str(e),
+                           fill="#999999", font=("Consolas", 7))
+        pts: list[float] = []
+        for e, v in zip(xs, values):
+            pts += [px(e), py(v)]
+        if len(pts) >= 4:
+            cv.create_line(*pts, fill=color, width=2, smooth=True)
 
     def _trim_log(self) -> None:
         """Keep the widget bounded: drop the oldest lines past LOG_MAX_LINES."""
@@ -402,6 +578,7 @@ class App:
         self.videos.append({"video": v, "roi": "", "compare_out": ""})
         self.current = len(self.videos) - 1
         self._fill_video_combo()
+        self._save_videos()  # added videos survive UI restarts
         self.refresh()
         if not self.roi_path(self.current_cfg()).is_file():
             self.status_var.set("新视频缺少区域框选,自动打开框选窗口 ...")
@@ -432,6 +609,8 @@ class App:
         if key == "pick_outdir":
             self.pick_outdir()
             return
+        if key == "train":
+            self.train_curve.clear()  # fresh curve for every training run
         if self.proc is not None and self.proc.poll() is None:
             messagebox.showwarning("任务运行中", "当前任务尚未结束，请先停止或等待完成。")
             return
@@ -506,6 +685,20 @@ class App:
                    command=self.annotate_stats).pack(side="left")
         ttk.Label(stat_row, text="已标注的帧不会重复标注,可随时再点 ④ 补充新的",
                   font=("Microsoft YaHei UI", 9), foreground="#666666").pack(side="left", padx=8)
+        set_row = ttk.Frame(tab_train)
+        set_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(set_row, text="训练设置:", font=FONT).pack(side="left")
+        ttk.Label(set_row, text="轮次", font=FONT).pack(side="left", padx=(8, 2))
+        ttk.Spinbox(set_row, from_=1, to=2000, textvariable=self.epochs_var,
+                    width=6, font=FONT).pack(side="left")
+        ttk.Label(set_row, text="学习率", font=FONT).pack(side="left", padx=(8, 2))
+        ttk.Entry(set_row, textvariable=self.lr_var, width=8, font=FONT).pack(side="left")
+        ttk.Label(set_row, text="(batch 固定 8; ⑦ 校准帧数 20)",
+                  font=("Microsoft YaHei UI", 9), foreground="#666666").pack(side="left", padx=8)
+        self.curve_cv = tk.Canvas(tab_train, height=170, bg="#fbfbfb",
+                                  highlightthickness=1, highlightbackground="#d0d0d0")
+        self.curve_cv.pack(fill="x", pady=(6, 0))
+        self.curve_cv.bind("<Configure>", lambda _e: self.draw_curve())
         ttk.Separator(tab_train).pack(fill="x", pady=6)
         for spec in PROC_STEPS:
             self._step_row(tab_proc, *spec)

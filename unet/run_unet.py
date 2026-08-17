@@ -9,8 +9,11 @@ compare   (re)generate head_method_comparison.csv for every video
 screen    pick maximally diverse frames + manually exclude junk frames
           (mouse absent, human intervention, ...) -> screening.csv
 annotate  open the torso-polygon labelling window on the screened frames
+          (8-point polygons; already labelled frames are skipped)
 prepare   export polygon labels from every video into one U-Net dataset
 train     train the U-Net (best validation Dice checkpoint)
+calibrate manual model calibration: 20 least-confident frames, correct
+          polygon + head + reflection, then auto re-prepare + retrain
 infer     segment a new video; excluded frames -> NaN + EXCLUDED overlay
 head      body (U-Net mask centroid) + head (miniscope reflection) tracking
 ui        GUI wizard: training / processing tabs, one click per step
@@ -54,6 +57,7 @@ VIDEOS = [
 ]
 SCREENING = ROOT / "traditional" / "results" / "screening.csv"
 LABELS = ROOT / "traditional" / "results" / "manual_torso_constraints.csv"
+HEADS = ROOT / "traditional" / "results" / "head_anchor_calibration.csv"
 DATASET = ROOT / "unet" / "datasets" / "project"
 MODEL = ROOT / "unet" / "models" / "project" / "best_unet.pt"
 INFER_OUT = ROOT / "results" / "video_unet"
@@ -149,7 +153,19 @@ def prepare_cmd(cfg: dict, w: str, h: str, a) -> tuple[Path, list[str]]:
 def train_cmd(v: dict, a) -> tuple[Path, list[str]]:
     return UNET / "train.py", [
         "--dataset", str(v["dataset"]), "--output-dir", str(v["model"].parent),
-        "--epochs", str(a.epochs), "--batch-size", str(a.batch_size)]
+        "--epochs", str(a.epochs), "--batch-size", str(a.batch_size),
+        "--lr", f"{a.lr:g}"]
+
+
+def calibrate_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
+    return UNET / "calibrate_model.py", [
+        "--video", str(cfg["video"]), "--model", str(v["model"]),
+        "--roi-json", str(cfg["roi"]), "--labels", str(v["labels"]),
+        "--heads", str(v["heads"]),
+        "--comparison-csv", str(cfg["compare_out"] / "head_method_comparison.csv"),
+        "--exclude-csv", str(a.screening), "--n-frames", str(a.calib_frames),
+        "--arena-width-cm", f"{a.arena_width_cm:.2f}", "--arena-height-cm", f"{a.arena_height_cm:.2f}",
+        "--threshold", f"{a.threshold:.2f}", "--rotate", str(a.rotate)]
 
 
 def infer_cmd(v: dict, a) -> tuple[Path, list[str]]:
@@ -216,11 +232,12 @@ def _torch_ok() -> bool:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=["check", "compare", "screen", "annotate", "prepare", "train", "infer", "head", "roi", "ui"])
+    p.add_argument("mode", choices=["check", "compare", "screen", "annotate", "prepare", "train", "calibrate", "infer", "head", "roi", "ui"])
     p.add_argument("--interactive", action="store_true", help="pick files with dialogs (train/infer)")
     p.add_argument("--video", type=Path, help="single-video override for loop modes")
     p.add_argument("--roi", type=Path); p.add_argument("--compare-out", type=Path, dest="compare_out")
     p.add_argument("--labels", type=Path, default=LABELS)
+    p.add_argument("--heads", type=Path, default=HEADS)
     p.add_argument("--screening", type=Path, default=SCREENING)
     p.add_argument("--dataset", type=Path, default=DATASET)
     p.add_argument("--model", type=Path, default=MODEL)
@@ -233,6 +250,9 @@ def main() -> None:
     p.add_argument("--size", type=int, default=256)
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--lr", type=float, default=2e-3)
+    p.add_argument("--calib-frames", type=int, default=20,
+                   help="low-confidence frames to calibrate after training")
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
                    help="arena turned vs training: rotate input frames for infer/head")
@@ -246,7 +266,8 @@ def main() -> None:
         videos = [cfg]
     v = {"video": videos[0]["video"], "model": a.model, "infer_out": a.infer_out,
          "dataset": a.dataset, "labels": a.labels, "screening": a.screening,
-         "roi": videos[0]["roi"]}
+         "heads": a.heads, "roi": videos[0]["roi"],
+         "compare_out": videos[0]["compare_out"]}
     if a.interactive:
         v = apply_dialogs(v, a.mode)
 
@@ -268,6 +289,13 @@ def main() -> None:
             code = run(*prepare_cmd(cfg, w, h, a)) or code
     elif a.mode == "train":
         code = run(*train_cmd(v, a))
+    elif a.mode == "calibrate":
+        cfg = {"video": v["video"], "roi": v["roi"], "compare_out": v["compare_out"]}
+        code = run(*calibrate_cmd(v, cfg, a))
+        if code == 0:  # corrections saved -> re-export + retrain
+            for cfg in videos:
+                code = run(*prepare_cmd(cfg, w, h, a)) or code
+            code = run(*train_cmd(v, a)) or code
     elif a.mode == "infer":
         cfg = {"video": v["video"]}
         code = run(*infer_cmd(v, a))
