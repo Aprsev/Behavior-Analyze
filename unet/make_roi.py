@@ -17,10 +17,13 @@ saving. Saved format matches traditional/basic_rois/*.json.
 """
 from __future__ import annotations
 
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
 import cv2
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from calibrate import refine_corners  # noqa: E402
 
 
 def default_output(video: Path) -> Path:
@@ -45,7 +48,7 @@ def main() -> None:
     if not ok:
         raise SystemExit(f"Cannot read first frame of {video}")
     out = Path(a.output) if a.output else default_output(video)
-    title = "Arena corners: click 4 corners | Backspace undo | R reset | S save | Q quit"
+    title = "Arena corners: click 4 corners | A auto-snap | Backspace undo | R reset | S save | Q quit"
     pts: list[tuple[int, int]] = []
 
     def on_mouse(event, x, y, flags, param):
@@ -78,6 +81,14 @@ def main() -> None:
             pts.pop()
         if k == ord("r"):
             pts.clear()
+        if k == ord("a") and len(pts) == 4:
+            # Auto-calibration: snap the 4 clicks to the detected arena edges.
+            refined = refine_corners(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+                                     np.asarray(pts, np.float32))
+            moved = sum(np.hypot(refined[i][0] - pts[i][0], refined[i][1] - pts[i][1]) > 1.5
+                        for i in range(4))
+            pts = [(int(round(x)), int(round(y))) for x, y in refined]
+            print(f"A: snapped {moved}/4 corners to the detected arena edges")
         if k == ord("s"):
             if len(pts) != 4:
                 print(f"Need exactly 4 corners; only {len(pts)} clicked.")

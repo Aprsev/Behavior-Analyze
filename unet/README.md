@@ -128,6 +128,29 @@ Outputs of inference include `mouse_miniscope_mask.mp4`,
 contains the CNN mask centroid; it is a clean body input for the later
 head/reflection pipeline.
 
+### Coordinate calibration & wall-band exclusion
+
+The ROI often includes the arena walls because the camera sees the mouse's
+shadow projected on them; wall content changes with the mouse and must not
+influence the segmentation.
+
+- `unet/calibrate.py` (automatic, no user input):
+  - `detect_floor_bounds`: finds the floor rectangle inside the rectified
+    background (Otsu bimodal split, solidity check). Everything outside it —
+    the wall band — is zeroed in the mask before computing the body centroid
+    and the reflection search, so wall projections can never shift the body
+    or create fake heads. Works with bright or dark walls; returns None when
+    there is no wall contrast (whole arena treated as floor).
+  - `refine_corners`: snaps the four clicked arena corners to the detected
+    arena edges (Hough lines), turning a 10-15 px click error into ~1 px —
+    this is what keeps every video on the same cm coordinate system.
+- `make_roi.py`: after clicking the 4 corners press **A** for auto-snap.
+- `head_track.py`: runs the floor detection automatically, logs the result
+  (e.g. `Floor detected (50, 40, 270, 200) (77% of rectified arena)`), draws
+  the floor outline in the overlay video, and records `floor_bounds` in the
+  metadata JSON. Check the overlay once per video: the orange rectangle must
+  match the real floor edges.
+
 ### Arena turned? (rotation robustness)
 
 If a new recording looks like the arena was rotated a quarter-turn vs the
