@@ -16,12 +16,15 @@ S save; Q/Esc save and quit.
 """
 from __future__ import annotations
 
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
 import shutil
 import cv2
 import numpy as np
 import pandas as pd
+UNET = Path(__file__).resolve().parents[2] / 'unet'
+sys.path.insert(0, str(UNET))
+from label_compat import as_bool, normalize_polygon, video_mask  # noqa: E402
 from mouse_behavior_pipeline import (
     perspective_geometry, robust_threshold, sample_frames, segment_mouse, video_properties,
 )
@@ -30,15 +33,6 @@ from mouse_behavior_pipeline import (
 def simplify(points: np.ndarray, count: int = 8) -> np.ndarray:
     if len(points) <= count: return points.astype(float)
     return points[np.linspace(0, len(points)-1, count, dtype=int)].astype(float)
-
-
-def as_bool(value) -> bool:
-    """Parse bool-like CSV values without treating the string 'False' as true."""
-    if pd.isna(value):
-        return False
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y"}
-    return bool(value)
 
 
 def scan_candidates(
@@ -129,7 +123,7 @@ def _select_frames(args, labels: dict, cap: cv2.VideoCapture, total: int,
             raise SystemExit(f'--candidate-csv {args.candidate_csv} not found.\n'
                              f'Run screening first: python unet/run_unet.py screen')
         cand = pd.read_csv(args.candidate_csv)
-        cand = cand.loc[cand.video == Path(args.input).name]
+        cand = cand.loc[video_mask(cand.video, Path(args.input).name)]
         if not len(cand):
             raise SystemExit(f'No screening rows for {Path(args.input).name}.\n'
                              f'Run screening first: python unet/run_unet.py screen')
@@ -153,6 +147,8 @@ def merge_labels(path: Path, video_name: str, rows: list[dict]) -> None:
     old = pd.read_csv(path) if path.exists() else pd.DataFrame(columns=["frame", "polygon_px", "exclude"])
     if "video" not in old.columns:
         old["video"] = video_name  # legacy single-video CSV: all rows are ours
+    else:
+        old.loc[video_mask(old.video, video_name), "video"] = video_name
     touched = [r["frame"] for r in rows]
     keep = ~((old.video == video_name) & old.frame.isin(touched))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,7 +184,8 @@ def merge_annotation_exclusions(screening_csv: str, video_name: str, label_rows:
     df = pd.read_csv(path)
     values = {int(row['frame']): as_bool(row.get('exclude')) for row in label_rows}
     for frame, excluded in values.items():
-        df.loc[(df.video == video_name) & (df.frame == frame), 'exclude'] = int(excluded)
+        matches = video_mask(df.video, video_name) if 'video' in df else pd.Series(True, index=df.index)
+        df.loc[matches & (df.frame == frame), 'exclude'] = int(excluded)
     df.to_csv(path, index=False)
     print(f'Synchronized exclusion state for {len(values)} annotations in {screening_csv}')
 
@@ -207,7 +204,7 @@ def main() -> None:
     if 'video' in old.columns:
         # Multi-video labels: only rows belonging to THIS video are valid;
         # the same frame number in another video is a different recording.
-        old = old.loc[old.video == Path(args.input).name]
+        old = old.loc[video_mask(old.video, Path(args.input).name)]
     labels={int(row.frame):row for _,row in old.iterrows()}
     corners=np.asarray(json.loads(Path(args.roi_json).read_text(encoding='utf-8'))['arena_corners_px'],np.float32)
     total,fps,_,_=video_properties(Path(args.input))
@@ -258,7 +255,7 @@ def main() -> None:
     def load():
         frame=frames[state['i']]; row=labels.get(frame)
         if row is not None and isinstance(row.polygon_px,str) and row.polygon_px:
-            state['points']=np.asarray(json.loads(row.polygon_px),float)
+            state['points']=normalize_polygon(row.polygon_px).astype(float)
         else: state['points']=auto_polygon(frame)
         state['drag']=None
     def commit_current():

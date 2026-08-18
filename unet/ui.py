@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import run_unet as R
+from label_compat import video_matches
 
 FONT = ("Microsoft YaHei UI", 10)
 SMALL = ("Microsoft YaHei UI", 9)
@@ -237,10 +238,11 @@ class App:
             try:
                 labels = pd.read_csv(self.args.labels)
                 if "video" in labels.columns:
-                    labelled_names = set(labels.loc[
+                    labelled_names = list(labels.loc[
                         labels.get("polygon_px", pd.Series(index=labels.index, dtype=object)).notna(),
                         "video"].astype(str))
-                    rows = [row for row in rows if Path(row["video"]).name in labelled_names]
+                    rows = [row for row in rows
+                            if any(video_matches(value, row["video"]) for value in labelled_names)]
             except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
                 pass
         return [self.local_cfg(row) for row in rows if Path(row["video"]).is_file()]
@@ -311,7 +313,10 @@ class App:
                 messagebox.showerror("缺少标注", "尚未找到已有多边形标注 CSV。"); return
             if not (cfg["compare_out"] / "head_method_comparison.csv").is_file():
                 messagebox.showerror("缺少对比数据", "请先运行“生成传统对比数据”。"); return
-            commands = [R.annotate_cmd(cfg, w, h, self.args, review_existing=True)]
+            # Immediately synchronize corrected/excluded rows into the
+            # training dataset so stale PNG masks cannot survive a review.
+            commands = [R.annotate_cmd(cfg, w, h, self.args, review_existing=True),
+                        R.prepare_cmd(cfg, w, h, self.args)]
         elif key == "calibrate":
             if not self.args.model.is_file():
                 messagebox.showerror("缺少模型", "请先训练模型。"); return
@@ -330,12 +335,15 @@ class App:
             messagebox.showerror("标注文件错误", str(exc)); return
         for cfg in self.videos:
             name = Path(cfg["video"]).name
-            torso = int((labels.video.astype(str) == name).sum()) if "video" in labels else 0
-            head = int((heads.video.astype(str) == name).sum()) if "video" in heads else 0
-            lines.append(f"{name}\n  torso mask: {torso}    head/reflection: {head}")
+            torso_rows = labels.loc[labels.video.map(lambda value: video_matches(value, name))] if "video" in labels else labels
+            head_rows = heads.loc[heads.video.map(lambda value: video_matches(value, name))] if "video" in heads else heads
+            torso_excluded = int(torso_rows.exclude.map(lambda value: str(value).strip().casefold() in
+                                 {"1", "true", "yes", "y", "excluded"}).sum()) if "exclude" in torso_rows else 0
+            lines.append(f"{name}\n  torso: {len(torso_rows)}（排除 {torso_excluded}）"
+                         f"    head/reflection: {len(head_rows)}")
         messagebox.showinfo("现有标注统计", "\n\n".join(lines) if lines else "没有标注记录")
 
-    def view_annotations(self, source: str = "csv") -> None:
+    def view_annotations(self, source: str = "all") -> None:
         """Open the paginated contact sheet without blocking this GUI."""
         if not self._sync_args():
             return
@@ -630,7 +638,7 @@ class App:
         quick_actions = ttk.Frame(quick_train); quick_actions.pack(fill="x", padx=10, pady=(0, 10))
         self._button(quick_actions, "一键重建数据集并训练", lambda: self.rebuild_dataset(True),
                      style="Primary.TButton", width=24).pack(side="left")
-        self._button(quick_actions, "拼接查看当前 CSV 标注", lambda: self.view_annotations("csv"),
+        self._button(quick_actions, "拼接查看全部已有标注", lambda: self.view_annotations("all"),
                      width=22).pack(side="left", padx=8)
         ttk.Label(quick_actions, text="每页 20 张；←/→ 翻页", font=SMALL,
                   foreground="#666").pack(side="left", padx=4)

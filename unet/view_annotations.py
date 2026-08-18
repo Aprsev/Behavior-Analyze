@@ -8,8 +8,9 @@ source videos. Only one page is decoded at a time.
 from __future__ import annotations
 
 import argparse
-import json
 import math
+import json
+import re
 from pathlib import Path
 
 import cv2
@@ -18,10 +19,7 @@ import pandas as pd
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import messagebox, ttk
-
-
-def _truthy(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip().str.lower().isin({"1", "true", "yes", "y"})
+from label_compat import as_bool, normalize_polygon, video_matches
 
 
 class ContactSheet:
@@ -54,8 +52,14 @@ class ContactSheet:
                 names = []
         if not names:
             names = [path.name for path in sorted(images.glob("*.png"))]
-        return [{"kind": "dataset", "name": name} for name in dict.fromkeys(names)
-                if (images / name).is_file() and (self.dataset / "masks" / name).is_file()]
+        items = []
+        for name in dict.fromkeys(names):
+            if not (images / name).is_file() or not (self.dataset / "masks" / name).is_file():
+                continue
+            match = re.match(r"(.+)_([0-9]{7})\.png$", name)
+            key = (match.group(1), int(match.group(2))) if match else (name, -1)
+            items.append({"kind": "dataset", "name": name, "key": key})
+        return items
 
     def _raw_items(self) -> list[dict]:
         labels_path = Path(self.args.labels)
@@ -67,25 +71,46 @@ class ContactSheet:
             return []
         if "polygon_px" not in rows or "frame" not in rows:
             return []
+        original = rows.copy()
+        total = len(rows)
+        excluded = int(rows["exclude"].map(as_bool).sum()) if "exclude" in rows else 0
         if "exclude" in rows:
-            rows = rows.loc[~_truthy(rows["exclude"].fillna(False))]
+            rows = rows.loc[~rows["exclude"].map(as_bool)]
         keys = [column for column in ("video", "frame") if column in rows]
         rows = rows.loc[rows["polygon_px"].notna()].drop_duplicates(keys, keep="last")
-        videos = {Path(path).name: Path(path) for path in self.args.video if Path(path).is_file()}
-        only_video = next(iter(videos.values())) if len(videos) == 1 else None
+        videos = [Path(path) for path in self.args.video if Path(path).is_file()]
+        manifest = self.dataset / "dataset.json"
+        if manifest.is_file():
+            try:
+                for record in json.loads(manifest.read_text(encoding="utf-8")).get("videos", []):
+                    path = Path(record.get("video", ""))
+                    if path.is_file() and path not in videos:
+                        videos.append(path)
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+        only_video = videos[0] if len(videos) == 1 else None
         items = []
+        invalid = unmatched = 0
         for _, row in rows.iterrows():
-            video = videos.get(str(row.get("video", "")), only_video)
+            video = next((path for path in videos if video_matches(row.get("video", ""), path)), only_video)
             if video is None:
+                unmatched += 1
                 continue
             try:
-                polygon = np.asarray(json.loads(str(row.polygon_px)), np.int32)
-            except (json.JSONDecodeError, TypeError, ValueError):
+                polygon = normalize_polygon(row.polygon_px).astype(np.int32)
+            except (TypeError, ValueError):
+                invalid += 1
                 continue
-            if polygon.ndim != 2 or polygon.shape[0] < 3:
-                continue
-            items.append({"kind": "raw", "name": f"{video.name} · frame {int(row.frame)}",
-                          "video": video, "frame": int(row.frame), "polygon": polygon})
+            frame = int(row.frame)
+            items.append({"kind": "raw", "name": f"{video.name} · frame {frame}",
+                          "video": video, "frame": frame, "polygon": polygon,
+                          "key": (video.stem.replace(" ", "_"), frame)})
+        excluded_rows = rows.iloc[0:0]
+        if "exclude" in original:
+            excluded_rows = original.loc[original["exclude"].map(as_bool)]
+        self.csv_excluded = [(str(row.get("video", "")), int(row.frame))
+                             for _, row in excluded_rows.iterrows()]
+        self.csv_stats = f"CSV {total}；排除 {excluded}；显示 {len(items)}；无法匹配视频 {unmatched}；格式错误 {invalid}"
         return items
 
     def _load_items(self) -> list[dict]:
@@ -93,6 +118,15 @@ class ContactSheet:
         if self.args.source == "dataset":
             self.mode = "上次重建的训练数据（绿色=mask，红色=head）"
             return dataset
+        if self.args.source == "all":
+            raw_keys = {item["key"] for item in raw}
+            excluded = getattr(self, "csv_excluded", [])
+            historical = [item for item in dataset if item["key"] not in raw_keys and
+                          not any(frame == item["key"][1] and video_matches(value, item["key"][0])
+                                  for value, frame in excluded)]
+            self.mode = "全部标注：当前 CSV 轮廓 + 未迁移旧格式的历史训练样本"
+            self.csv_stats += f"；历史补充 {len(historical)}；合计 {len(raw) + len(historical)}"
+            return raw + historical
         if raw:
             self.mode = "当前 CSV 原始标注（绿色=轮廓；保存后立即反映）"
             return raw
@@ -106,7 +140,8 @@ class ContactSheet:
         toolbar = ttk.Frame(self.root)
         toolbar.pack(fill="x", padx=10, pady=8)
         ttk.Label(toolbar, text=self.mode, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        ttk.Label(toolbar, text=f"共 {len(self.items)} 张", foreground="#555").pack(side="left", padx=12)
+        details = getattr(self, "csv_stats", f"共 {len(self.items)} 张")
+        ttk.Label(toolbar, text=details, foreground="#555").pack(side="left", padx=12)
         ttk.Button(toolbar, text="上一页  ←", command=lambda: self.move(-1)).pack(side="right", padx=4)
         ttk.Button(toolbar, text="下一页  →", command=lambda: self.move(1)).pack(side="right", padx=4)
         ttk.Label(toolbar, textvariable=self.page_var).pack(side="right", padx=12)
@@ -202,7 +237,7 @@ def main() -> None:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--labels", required=True)
     parser.add_argument("--video", action="append", default=[])
-    parser.add_argument("--source", choices=("csv", "dataset"), default="csv")
+    parser.add_argument("--source", choices=("all", "csv", "dataset"), default="all")
     args = parser.parse_args()
     root = tk.Tk()
     try:

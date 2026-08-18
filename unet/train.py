@@ -42,6 +42,12 @@ def manifest_files(root: Path) -> list[str]:
         if not samples:
             stem = video.get("stem") or Path(video["video"]).stem.replace(" ", "_")
             samples = [f"{stem}_{int(f):07d}.png" for f in video.get("frames", [])]
+        excluded = {int(frame) for frame in video.get("excluded_frames", [])}
+        leaked = [name for name in samples
+                  if int(Path(str(name)).stem.rsplit("_", 1)[-1]) in excluded]
+        if leaked:
+            raise ValueError(f"Manifest contains {len(leaked)} excluded training samples; "
+                             f"rerun rebuild. First: {leaked[0]}")
         files.extend(str(name) for name in samples)
     files = sorted(dict.fromkeys(files))
     missing = [f for f in files if not (root / "images" / f).is_file()

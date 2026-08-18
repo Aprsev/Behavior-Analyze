@@ -16,6 +16,7 @@ import argparse, json, sys
 from pathlib import Path
 import cv2, numpy as np, pandas as pd
 from preprocess import estimate_background, save_background
+from label_compat import as_bool, normalize_polygon, video_mask
 
 ROOT = Path(__file__).resolve().parents[1]
 CODE = ROOT / "traditional" / "code"
@@ -37,20 +38,28 @@ def main():
     p.add_argument('--arena-height-cm', type=float, default=30.0)
     p.add_argument('--output-dir', required=True); p.add_argument('--size', type=int, default=256)
     p.add_argument('--exclude-csv', default=''); a = p.parse_args()
-    labels = pd.read_csv(a.labels); labels = labels.loc[~labels.exclude.fillna(False).astype(bool)]
+    labels = pd.read_csv(a.labels)
     if 'polygon_px' not in labels:
         raise ValueError('labels must be polygon-based manual_torso_constraints.csv')
     if 'video' in labels.columns:
         # Multi-video labels: each row belongs to one recording; the same frame
         # number in another video is a different image, so filter strictly.
-        labels = labels.loc[labels.video == Path(a.video).name]
-        print(f'Using {len(labels)} labels for {Path(a.video).name}')
-    excluded = set()
+        labels = labels.loc[video_mask(labels.video, Path(a.video).name)]
+    labels = labels.drop_duplicates('frame', keep='last')
+    matched_label_count = len(labels)
+    label_excluded = set(labels.loc[labels.exclude.map(as_bool), 'frame'].astype(int)) if 'exclude' in labels else set()
+    excluded = set(label_excluded)
+    screening_excluded = set()
     if a.exclude_csv and Path(a.exclude_csv).is_file():
         ex = pd.read_csv(a.exclude_csv)
-        ex = ex.loc[ex.exclude.fillna(False).astype(bool) & (ex.video == Path(a.video).name)]
-        excluded = set(int(f) for f in ex.frame)
-        print(f'Excluding {len(excluded)} screened frames of {Path(a.video).name}')
+        matches = video_mask(ex.video, Path(a.video).name) if 'video' in ex else pd.Series(True, index=ex.index)
+        ex = ex.loc[ex.exclude.map(as_bool) & matches]
+        screening_excluded = set(int(f) for f in ex.frame)
+        excluded.update(screening_excluded)
+    labels = labels.loc[~labels.frame.astype(int).isin(excluded)]
+    print(f'Label audit for {Path(a.video).name}: matched={matched_label_count}, '
+          f'usable={len(labels)}, excluded_union={len(excluded)}, '
+          f'label_excluded={len(label_excluded)}, screening_excluded={len(screening_excluded)}')
     out = Path(a.output_dir); images = out / 'images'; masks = out / 'masks'; head_dir = out / 'heads'
     images.mkdir(parents=True, exist_ok=True); masks.mkdir(parents=True, exist_ok=True)
     head_dir.mkdir(parents=True, exist_ok=True)
@@ -59,9 +68,9 @@ def main():
     if a.heads and Path(a.heads).is_file():
         heads = pd.read_csv(a.heads)
         if 'video' in heads.columns:
-            heads = heads.loc[heads.video == Path(a.video).name]
+            heads = heads.loc[video_mask(heads.video, Path(a.video).name)]
         if 'exclude' in heads.columns:
-            heads = heads.loc[~heads.exclude.fillna(False).astype(bool)]
+            heads = heads.loc[~heads.exclude.map(as_bool)]
         if len(heads):
             heads = heads.drop_duplicates('frame', keep='last').set_index('frame')
     inverse = None; rect_w = rect_h = None
@@ -77,7 +86,11 @@ def main():
             continue
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index); ok, frame = cap.read()
         if not ok: continue
-        polygon = np.asarray(json.loads(row.polygon_px), np.float32)
+        try:
+            polygon = normalize_polygon(row.polygon_px)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            print(f'WARNING: skipped invalid polygon frame {frame_index}: {exc}')
+            continue
         mask = np.zeros(frame.shape[:2], np.uint8)
         cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -94,7 +107,7 @@ def main():
             hr = heads.loc[frame_index]
             hx = pd.to_numeric(hr.get('head_x_cm'), errors='coerce')
             hy = pd.to_numeric(hr.get('head_y_cm'), errors='coerce')
-            present = bool(hr.get('head_present', True))
+            present = as_bool(hr.get('head_present', True))
             if present and np.isfinite(hx) and np.isfinite(hy):
                 rect_pt = np.asarray([[[float(hx) / a.arena_width_cm * (rect_w - 1),
                                         float(hy) / a.arena_height_cm * (rect_h - 1)]]], np.float32)
@@ -132,12 +145,18 @@ def main():
               f'train.py will use raw frames for this video')
     manifest = {'video': str(Path(a.video).resolve()), 'count': len(written), 'size': a.size,
                 'frames': written, 'samples': sorted(wanted), 'stem': stem,
+                'source_label_count': matched_label_count,
+                'label_excluded_frames': sorted(label_excluded),
+                'screening_excluded_frames': sorted(screening_excluded),
+                'excluded_frames': sorted(excluded),
                 'head_count': int(sum(cv2.imread(str(head_dir / name), 0).max() > 0 for name in wanted)),
                 'background': str(bg_path) if bg is not None else ''}
     if (out / 'dataset.json').exists():
         old = json.loads((out / 'dataset.json').read_text(encoding='utf-8'))
         videos = old.get('videos') or []
-        videos = [v for v in videos if v.get('video') != manifest['video']]
+        # Replace by stable stem as well as absolute path. This prevents an old
+        # host path from retaining excluded samples after project migration.
+        videos = [v for v in videos if v.get('video') != manifest['video'] and v.get('stem') != stem]
         videos.append(manifest)
     else:
         videos = [manifest]
