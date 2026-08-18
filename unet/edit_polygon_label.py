@@ -46,6 +46,14 @@ def create_editor_window(title: str, preview: np.ndarray, mouse_callback) -> Non
     raise RuntimeError("OpenCV could not create an interactive editor window. " + " | ".join(errors))
 
 
+def window_is_visible(title: str) -> bool:
+    """OpenCV 5 Qt throws after X destroys a window instead of returning -1."""
+    try:
+        return cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) >= 1
+    except cv2.error:
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", required=True)
@@ -135,7 +143,7 @@ def main() -> None:
     first_preview = cv2.resize(image, display_size, interpolation=cv2.INTER_LINEAR)
     create_editor_window(title, first_preview, mouse)
     while True:
-        if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
+        if not window_is_visible(title):
             save(); break
         shown = cv2.resize(image, display_size, interpolation=cv2.INTER_LINEAR)
         polygon = np.rint(state["points"] * scale).astype(np.int32)
@@ -166,7 +174,12 @@ def main() -> None:
         elif key in (8, 127) and len(state["points"]) > 3:
             index, _ = nearest(*state["last"])
             state["points"] = np.delete(state["points"], index, axis=0); save()
-    cv2.destroyAllWindows()
+    try:
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+    except cv2.error:
+        # Qt has already destroyed the native receiver when the user clicks X.
+        pass
     print(f"Saved frame {args.frame} {state['saved']} time(s) to {args.labels}")
 
 

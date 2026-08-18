@@ -4,7 +4,9 @@ from unittest.mock import patch
 
 import numpy as np
 
-from edit_polygon_label import create_editor_window
+import cv2
+
+from edit_polygon_label import create_editor_window, window_is_visible
 
 
 class EditorWindowTests(unittest.TestCase):
@@ -19,6 +21,11 @@ class EditorWindowTests(unittest.TestCase):
             create_editor_window("editor", preview, lambda *_: None)
         self.assertLess(order.index("shown"), order.index("callback"))
         self.assertLess(order.index("waited"), order.index("callback"))
+
+    def test_destroyed_qt_window_is_normal_close(self):
+        with patch("edit_polygon_label.cv2.getWindowProperty",
+                   side_effect=cv2.error("NULL guiReceiver")):
+            self.assertFalse(window_is_visible("already destroyed"))
 
 
 if __name__ == "__main__":
