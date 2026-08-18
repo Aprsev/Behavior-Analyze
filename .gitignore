@@ -20,3 +20,4 @@ median_background.png
 
 # GUI state
 unet/.ui_videos.json
+unet/.ui_state.json

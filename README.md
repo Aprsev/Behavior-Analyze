@@ -2,7 +2,10 @@
 
 `Behavior Analyze` is an automated computer-vision pipeline for tracking one mouse in a static-camera rectangular open-field arena. It detects the arena, removes perspective distortion, constructs a static background model, segments the mouse, estimates body-centroid and head positions, converts positions to centimetres, and writes both numerical trajectories and an annotated video. Explicit input paths support MP4, AVI, MOV, MKV, M4V, and WMV files.
 
-The implementation is classical and explainable: OpenCV, NumPy, and pandas are used without a trained pose-estimation model. This makes the pipeline easy to deploy, but head coordinates remain heuristic estimates and must be visually validated for each recording setup.
+The repository now contains two independent paths: `traditional/` keeps the
+classical OpenCV implementation, while `unet/` is the GPU-oriented,
+fibre-aware segmentation and learned-head pipeline recommended for recordings
+with a tethered miniscope.
 
 ## Scope and assumptions
 
@@ -354,15 +357,24 @@ behavior_analyze/
 
 ## Scientific desktop GUI
 
-Launch the guided desktop application with:
+For tethered-miniscope videos, launch the U-Net production GUI:
+
+```powershell
+python unet/run_unet.py ui
+```
+
+Its default tab performs one-pass full analysis and writes the clean mask,
+head/body overlay, trajectory CSV and metadata. A second tab rebuilds and
+trains from existing labels without requiring more annotation; manual tools
+are isolated on an advanced tab. Every video has its own ROI and output path,
+and all long operations run in cancellable child processes.
+
+In **使用已有标注训练**, click **一键重建数据集并训练** to reuse all saved
+annotations. **拼接查看已标注数据** displays 20 overlaid samples per page, with
+arrow-key pagination, instead of reopening labels one frame at a time.
+
+The legacy classical GUI remains available with:
 
 ```powershell
 python traditional/behavior_analyze_gui.py
 ```
-
-The GUI uses a background `QProcess` for every long-running operation. Video
-decoding, model training and MP4 writing never run on the GUI thread, so the
-window remains responsive and the process log continues updating during long
-tasks. The recommended order is: **Prepare ROI + candidates**, adjust torso
-polygons, correct head/reflection anchors, train the calibration model, then
-run inference and inspect the annotated MP4.

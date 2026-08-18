@@ -20,8 +20,9 @@ from __future__ import annotations
 import argparse, json
 from pathlib import Path
 import cv2, numpy as np, pandas as pd, torch
-from model import UNet
-from preprocess import estimate_background, bg_centered
+from model import checkpoint_model
+from preprocess import estimate_background
+from postprocess import TemporalMaskFilter, model_input
 
 def rot_pt(p, k, h, w):
     """(col,row) in an (h,w) frame -> (col,row) in np.rot90(frame,k)."""
@@ -43,6 +44,8 @@ def main():
     p.add_argument('--video', required=True); p.add_argument('--model', required=True)
     p.add_argument('--output-dir', required=True); p.add_argument('--threshold', type=float, default=.5)
     p.add_argument('--rotate', type=int, default=0, choices=[0, 90, 180, 270])
+    p.add_argument('--fibre-opening', type=int, default=5)
+    p.add_argument('--reacquire-sec', type=float, default=.35)
     p.add_argument('--exclude-csv', default=''); a = p.parse_args()
     excluded = set()
     if a.exclude_csv and Path(a.exclude_csv).is_file():
@@ -52,14 +55,15 @@ def main():
         print(f'Marking {len(excluded)} screened frames as excluded')
     pack = torch.load(a.model, map_location='cpu')
     size = int(pack['size']); dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-    net = UNet().to(dev); net.load_state_dict(pack['state_dict']); net.eval()
+    in_channels = int(pack.get('in_channels', 2 if pack.get('dual_channel') else 1))
+    net = checkpoint_model(pack, dev); net.eval()
     cap = cv2.VideoCapture(a.video)
     fps = cap.get(cv2.CAP_PROP_FPS); w, h = int(cap.get(3)), int(cap.get(4))
     k = int(a.rotate) // 90 % 4
     # Background-invariant preprocessing, identical to train.py: only active
     # when the model was trained with it, so old checkpoints are unaffected.
     bg_small = None
-    if bool(pack.get('bg_subtract')):
+    if bool(pack.get('bg_subtract')) or in_channels > 1:
         bg = estimate_background(a.video)
         if bg is not None:
             bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
@@ -74,6 +78,8 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     mw = cv2.VideoWriter(str(out / 'mouse_miniscope_mask.mp4'), fourcc, fps, (w, h))
     ow = cv2.VideoWriter(str(out / 'mouse_miniscope_overlay.mp4'), fourcc, fps, (w, h))
+    temporal = TemporalMaskFilter(fps=fps, opening_px=a.fibre_opening, hold_frames=3,
+                                  reacquire_frames=max(8, round(fps * a.reacquire_sec)))
     rows = []; i = 0
     while True:
         ok, frame = cap.read()
@@ -88,21 +94,21 @@ def main():
             hi, wi = frame_in.shape[:2]
             gray = cv2.cvtColor(frame_in, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (size, size))
-            if bg_small is not None:
-                small = bg_centered(small, bg_small)
-            x = torch.from_numpy(small[None, None].copy()).float().to(dev) / 255
+            channels = model_input(small, bg_small, in_channels, float(pack.get('bg_gain', 2.0)))
+            x = torch.from_numpy(channels[None].copy()).float().to(dev) / 255
             with torch.no_grad():
-                prob = torch.sigmoid(net(x))[0, 0].cpu().numpy()
-            mask = (cv2.resize(prob, (wi, hi)) >= a.threshold).astype(np.uint8) * 255
-            n, labels, stats, cent = cv2.connectedComponentsWithStats(mask)
-            if n > 1:
-                label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-                clean = (labels == label).astype(np.uint8) * 255
-                cx, cy = cent[label]
+                output = net(x)
+                mask_logits = output[0] if isinstance(output, tuple) else output
+                prob = torch.sigmoid(mask_logits)[0, 0].cpu().numpy()
+            result = temporal.update(prob, a.threshold)
+            if result.centroid is not None:
+                clean = cv2.resize(result.mask, (wi, hi), interpolation=cv2.INTER_NEAREST)
+                cx = result.centroid[0] * wi / size
+                cy = result.centroid[1] * hi / size
                 if k:
                     cx, cy = inv_rot_pt((float(cx), float(cy)), k, h, w)
             else:
-                clean = np.zeros_like(mask); cx = cy = np.nan
+                clean = np.zeros((hi, wi), np.uint8); cx = cy = np.nan
             if k:
                 clean = np.rot90(clean, -k)
             overlay = frame.copy(); overlay[clean > 0] = (0, 220, 0)
@@ -112,7 +118,10 @@ def main():
     cap.release(); mw.release(); ow.release()
     pd.DataFrame(rows, columns=['frame', 'timestamp_sec', 'body_x_px', 'body_y_px']).to_csv(
         out / 'unet_trajectory.csv', index=False)
-    manifest = {'device': dev, 'frames': i, 'threshold': a.threshold, 'rotate': a.rotate,
+    manifest = {'input': str(Path(a.video).resolve()), 'model': str(Path(a.model).resolve()),
+                'device': dev, 'frames': i, 'threshold': a.threshold, 'rotate': a.rotate,
+                'in_channels': in_channels, 'fibre_aware_temporal_filter': True,
+                'fibre_opening': a.fibre_opening, 'reacquire_sec': a.reacquire_sec,
                 'bg_subtract': bg_small is not None,
                 'excluded_frames': sorted(excluded & set(range(i))),
                 'excluded_count': len(excluded & set(range(i)))}

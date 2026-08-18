@@ -1,760 +1,683 @@
 #!/usr/bin/env python3
-"""GUI wizard for the whole run_unet.py workflow.
+"""Production desktop GUI for fibre-aware U-Net training and analysis.
 
-Two modes (notebook tabs):
-  Training:   roi -> compare -> screen -> annotate -> prepare -> train
-  Processing: 5-step wizard for a new video:
-              ① pick video -> ② ROI box -> ③ output folder -> ④ infer -> ⑤ head
-Every step launches exactly the same command the CLI launcher would run, in
-a background thread, streaming output to the log pane. Step state is read
-from the artifacts on disk (ROI JSON, comparison.csv, screening.csv,
-labels, dataset, model, trajectory CSVs); an "apply to all videos" toggle
-controls whether loop steps run on one or on every recording. New videos
-are added through step ① and get their ROI through the corner picker
-automatically (step ②, or opened right after picking a new video).
-
-Run: python unet/run_unet.py ui
+The UI is intentionally a thin controller around the same scripts used by
+the CLI. Long video/GPU work always runs in a child process; Tk is touched
+only by the main thread through a queue-driven state machine.
 """
 from __future__ import annotations
 
 from collections import deque
 import json
+import os
+import queue
 import subprocess
 import sys
 import threading
-import time
 from argparse import Namespace
 from pathlib import Path
 
 import pandas as pd
-
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import run_unet as R
 
 FONT = ("Microsoft YaHei UI", 10)
-DONE, READY, WARN = "done", "ready", "warn"
-LOOP_STEPS = ("roi", "compare", "screen", "annotate", "prepare")
-# Log throttling: keep the UI responsive during long runs (10-min videos,
-# training). The widget keeps at most LOG_MAX_LINES, each pump inserts at
-# most LOG_PUMP_BATCH lines, and the worker-side queue is bounded so a
-# chatty child process cannot grow memory without limit.
-LOG_MAX_LINES = 4000
-LOG_PUMP_BATCH = 200
-LOG_QUEUE_MAX = 4000
-
-TRAIN_STEPS = [
-    ("roi",      "① ROI 四角标注", "新视频:点竞技场 4 个角"),
-    ("compare",  "② 生成对比数据", "生成 head_method_comparison.csv"),
-    ("screen",   "③ 帧筛选",      "排除无鼠 / 实验者干预帧"),
-    ("annotate", "④ 多边形标注",   "约 8 个点描身体轮廓(需 ②③)"),
-    ("prepare",  "⑤ 数据集导出",   "生成 images/masks(需 ④)"),
-    ("train",    "⑥ 模型训练",     "训练 U-Net(需 ⑤,实时 loss 曲线)"),
-    ("calibrate", "⑦ 校准并重训",  "20 个低置信度帧:多边形+反光点+头点"),
-]
-# Processing tab is a guided wizard for a NEW video: pick the file, box the
-# arena, choose where to save, then run the two processing steps.
-PROC_STEPS = [
-    ("pick_video",  "① 选择视频",     "当前视频名(点击更换)"),
-    ("pick_roi",    "② 区域框选",     "点击竞技场 4 角(A 自动吸附,S 保存)"),
-    ("pick_outdir", "③ 保存文件夹",   "输出目录:轨迹 CSV / 视频 / 模型记录"),
-    ("infer",       "④ 分割推理",     "全帧 UNet 分割 -> mask/overlay"),
-    ("head",        "⑤ 头+身体跟踪",  "mask 质心 + 反光点头部(需 ④)"),
-]
-DEPENDENCIES = {
-    "annotate": ("compare", "screen"),
-    "prepare":  ("annotate",),
-    "train":    ("prepare",),
-    "calibrate": ("train",),
-    "head":     ("infer",),
-}
-STATE_TEXT = {DONE: "✓ 完成", READY: "○ 待运行", WARN: "△ 依赖缺失"}
-STATE_COLOR = {DONE: "#1a7f37", READY: "#0b57d0", WARN: "#b06000"}
-_PICK_KEYS = ("pick_video", "pick_roi", "pick_outdir")
-# training steps whose hint shows live counters instead of static text
-_HINT_KEYS = _PICK_KEYS + ("screen", "annotate", "prepare", "train", "calibrate")
+SMALL = ("Microsoft YaHei UI", 9)
+STATE_FILE = Path(__file__).resolve().parent / ".ui_state.json"
+LEGACY_VIDEO_FILE = Path(__file__).resolve().parent / ".ui_videos.json"
+LOG_MAX_LINES = 5000
 
 
-def build_args() -> Namespace:
+def default_args() -> Namespace:
     return Namespace(
-        screening=R.SCREENING, labels=R.LABELS, heads=R.HEADS, dataset=R.DATASET,
-        model=R.MODEL, infer_out=R.INFER_OUT,
+        screening=R.SCREENING, labels=R.LABELS, heads=R.HEADS,
+        dataset=R.DATASET, model=R.MODEL, infer_out=R.INFER_OUT,
         arena_width_cm=R.ARENA_WIDTH_CM, arena_height_cm=R.ARENA_HEIGHT_CM,
         max_labels=10, per_video=10, junk=20, size=256,
         epochs=80, batch_size=8, lr=2e-3, calib_frames=20,
-        threshold=0.5, rotate=0,
+        threshold=.5, fibre_opening=5, reacquire_sec=.35, rotate=0,
     )
 
 
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.args = build_args()
+        self.args = default_args()
+        self.saved = self._read_state()
         self.videos = self._load_videos()
-        self.current = 0
+        self.current = min(int(self.saved.get("current", 0)), max(len(self.videos) - 1, 0))
         self.proc: subprocess.Popen | None = None
-        self.log_q: deque[str] = deque(maxlen=LOG_QUEUE_MAX)  # drops oldest
-        self.log_lines = 0  # current line count of the log Text widget
-        self.all_var = tk.BooleanVar(value=True)
-        self.rotate_var = tk.IntVar(value=0)
+        self.running = False
+        self.current_script: Path | None = None
+        self.events: queue.Queue = queue.Queue()
+        self.command_queue: deque[tuple[Path, list[str]]] = deque()
+        self.cancelled = False
+        self.task_success_callback = None
+        self.action_buttons: list[ttk.Button] = []
+        self.train_curve: dict[int, tuple[float, float]] = {}
+        self.log_lines = 0
+
         self.video_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
-        self.epochs_var = tk.StringVar(value=str(self.args.epochs))
-        self.lr_var = tk.StringVar(value=f"{self.args.lr:g}")
-        self.per_video_var = tk.StringVar(value=str(self.args.per_video))
-        self.step_rows: dict[str, tuple[tk.Label, tk.Label, ttk.Label]] = {}
-        # live training curve: epoch -> (train_loss, val_dice)
-        self.train_curve: dict[int, tuple[float, float]] = {}
-        self._curve_last_draw = 0.0
-        self._curve_pending = False
+        self.model_var = tk.StringVar(value=str(self.saved.get("model", self.args.model)))
+        self.output_var = tk.StringVar()
+        self.dataset_var = tk.StringVar(value=str(self.saved.get("dataset", self.args.dataset)))
+        self.threshold_var = tk.StringVar(value=str(self.saved.get("threshold", .5)))
+        self.fibre_var = tk.StringVar(value=str(self.saved.get("fibre_opening", 5)))
+        self.reacquire_var = tk.StringVar(value=str(self.saved.get("reacquire_sec", .35)))
+        self.rotate_var = tk.IntVar(value=int(self.saved.get("rotate", 0)))
+        self.epochs_var = tk.StringVar(value=str(self.saved.get("epochs", 80)))
+        self.batch_var = tk.StringVar(value=str(self.saved.get("batch_size", 8)))
+        self.lr_var = tk.StringVar(value=str(self.saved.get("lr", .002)))
+        self.per_video_var = tk.StringVar(value=str(self.saved.get("per_video", 10)))
+        self.all_train_var = tk.BooleanVar(value=bool(self.saved.get("all_train", True)))
+        self.analysis_summary_var = tk.StringVar()
+        self.training_summary_var = tk.StringVar()
+        self.roi_summary_var = tk.StringVar()
+
         self._build_ui()
         self._fill_video_combo()
-        self._start_log_pump()
+        self._select_current()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(100, self._poll_events)
         self.refresh()
-        self.draw_curve()
 
-    # ------------------------------------------------------------ paths ---
-    def _load_videos(self) -> list[dict]:
-        """Persisted video list (unet/.ui_videos.json) survives UI restarts;
-        videos added via step ① are not lost. Falls back to run_unet.VIDEOS."""
-        f = Path(__file__).resolve().parent / ".ui_videos.json"
-        if f.is_file():
-            try:
-                saved = json.loads(f.read_text(encoding="utf-8")).get("videos") or []
-                if saved:
-                    out = []
-                    for v in saved:
-                        if Path(v["video"]).is_file():
-                            out.append({"video": Path(v["video"]),
-                                        "roi": Path(v.get("roi") or ""),
-                                        "compare_out": Path(v.get("compare_out") or "")})
-                    if out:
-                        return out
-            except (json.JSONDecodeError, OSError, KeyError, TypeError):
-                pass
-        return [dict(c) for c in R.VIDEOS]
-
-    def _save_videos(self) -> None:
-        f = Path(__file__).resolve().parent / ".ui_videos.json"
+    # ---------------------------------------------------------- state/files
+    def _read_state(self) -> dict:
         try:
-            f.write_text(json.dumps(
-                {"videos": [{"video": str(v["video"]), "roi": str(v.get("roi") or ""),
-                             "compare_out": str(v.get("compare_out") or "")}
-                            for v in self.videos]}, indent=2), encoding="utf-8")
-        except OSError:
-            pass  # persistence is best-effort, never blocks the UI
+            return json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.is_file() else {}
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {}
 
-    def current_cfg(self) -> dict:
+    def _load_videos(self) -> list[dict]:
+        rows = self.saved.get("videos") or []
+        if not rows and LEGACY_VIDEO_FILE.is_file():
+            try:
+                rows = json.loads(LEGACY_VIDEO_FILE.read_text(encoding="utf-8")).get("videos") or []
+            except (OSError, json.JSONDecodeError):
+                rows = []
+        out = []
+        for row in rows:
+            try:
+                video = Path(row["video"])
+            except (KeyError, TypeError):
+                continue
+            if video.is_file():
+                out.append({"video": video, "roi": Path(row.get("roi") or ""),
+                            "compare_out": Path(row.get("compare_out") or ""),
+                            "output": Path(row.get("output") or "")})
+        if not out:
+            out = [dict(row) for row in R.VIDEOS if Path(row["video"]).is_file()]
+        if not out:
+            out = [{"video": R.ROOT / "data" / "select_video.avi",
+                    "roi": Path(""), "compare_out": Path(""), "output": Path("")}]
+        return out
+
+    def _save_state(self) -> None:
+        self._sync_args(show_error=False)
+        data = {
+            "current": self.current, "model": str(self.args.model),
+            "dataset": str(self.args.dataset), "threshold": self.args.threshold,
+            "fibre_opening": self.args.fibre_opening,
+            "reacquire_sec": self.args.reacquire_sec, "rotate": self.args.rotate,
+            "epochs": self.args.epochs, "batch_size": self.args.batch_size,
+            "lr": self.args.lr, "per_video": self.args.per_video,
+            "all_train": bool(self.all_train_var.get()),
+            "videos": [{"video": str(v["video"]), "roi": str(v.get("roi") or ""),
+                        "compare_out": str(v.get("compare_out") or ""),
+                        "output": str(v.get("output") or "")} for v in self.videos],
+        }
+        try:
+            STATE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            self.log(f"WARNING: 无法保存 UI 设置: {exc}\n")
+
+    def cfg(self) -> dict:
         return self.videos[self.current]
 
-    def roi_path(self, cfg: dict) -> Path:
-        p = Path(cfg.get("roi", ""))
-        if p.is_file():
-            return p
+    def roi_path(self, cfg: dict | None = None) -> Path:
+        cfg = cfg or self.cfg()
+        saved = Path(cfg.get("roi") or "")
+        if saved.is_file():
+            return saved
         return R.ROOT / "traditional" / "basic_rois" / f"{Path(cfg['video']).stem}_roi.json"
 
+    def compare_path(self, cfg: dict | None = None) -> Path:
+        cfg = cfg or self.cfg()
+        return Path(cfg.get("compare_out") or
+                    R.ROOT / "traditional" / "results" / "basic_recognition" / Path(cfg["video"]).stem)
+
+    def output_path(self, cfg: dict | None = None) -> Path:
+        cfg = cfg or self.cfg()
+        saved = Path(cfg.get("output") or "")
+        return saved if str(saved) not in ("", ".") else R.ROOT / "results" / f"{Path(cfg['video']).stem}_unet"
+
     def local_cfg(self, cfg: dict) -> dict:
-        c = dict(cfg)
-        c["roi"] = str(self.roi_path(cfg))
-        # keep Path: annotate_cmd does cfg["compare_out"] / "file.csv"
-        c["compare_out"] = Path(cfg.get("compare_out") or
-                                R.ROOT / "traditional" / "results" / "basic_recognition" / Path(cfg["video"]).stem)
-        return c
+        return {"video": Path(cfg["video"]), "roi": self.roi_path(cfg),
+                "compare_out": self.compare_path(cfg)}
 
     def make_v(self) -> dict:
-        return {"video": self.current_cfg()["video"], "model": self.args.model,
+        return {"video": Path(self.cfg()["video"]), "model": self.args.model,
                 "infer_out": self.args.infer_out, "dataset": self.args.dataset,
                 "labels": self.args.labels, "screening": self.args.screening,
                 "heads": self.args.heads}
 
-    # ----------------------------------------------------------- state ---
-    def status_of(self, key: str) -> str:
-        cfg = self.current_cfg()
-        if key == "roi":
-            ok = self.roi_path(cfg).is_file()
-        elif key == "compare":
-            out = cfg.get("compare_out") or R.ROOT / "traditional" / "results" / "basic_recognition" / Path(cfg["video"]).stem
-            ok = (Path(out) / "head_method_comparison.csv").is_file()
-        elif key == "screen":
-            ok = self.args.screening.is_file()
-        elif key == "annotate":
-            ok = self.args.labels.is_file()
-        elif key == "prepare":
-            images = self.args.dataset / "images"
-            ok = images.is_dir() and any(images.glob("*.png"))
-        elif key == "train":
-            ok = self.args.model.is_file()
-        elif key == "calibrate":
-            ok = self.args.heads.is_file()
-        elif key == "infer":
-            ok = (self.args.infer_out / "unet_trajectory.csv").is_file()
-        elif key == "head":
-            ok = (self.args.infer_out / "head_track_trajectory.csv").is_file()
-        elif key == "pick_video":
-            ok = True  # a video is always selected
-        elif key == "pick_roi":
-            ok = self.roi_path(cfg).is_file()
-        elif key == "pick_outdir":
-            ok = self.args.infer_out.is_dir()
-        else:
-            ok = False
-        return DONE if ok else READY
+    def _sync_args(self, show_error: bool = True) -> bool:
+        try:
+            self.args.model = Path(self.model_var.get().strip())
+            self.args.dataset = Path(self.dataset_var.get().strip())
+            self.args.infer_out = Path(self.output_var.get().strip())
+            self.args.threshold = min(.99, max(.01, float(self.threshold_var.get())))
+            opening = max(3, int(self.fibre_var.get()))
+            self.args.fibre_opening = opening if opening % 2 else opening + 1
+            self.args.reacquire_sec = min(10., max(.05, float(self.reacquire_var.get())))
+            self.args.rotate = int(self.rotate_var.get())
+            self.args.epochs = max(1, int(self.epochs_var.get()))
+            self.args.batch_size = max(1, int(self.batch_var.get()))
+            self.args.lr = max(1e-6, float(self.lr_var.get()))
+            self.args.per_video = max(1, int(self.per_video_var.get()))
+            self.args.max_labels = self.args.per_video
+            self.cfg()["output"] = self.args.infer_out
+            return True
+        except (ValueError, tk.TclError) as exc:
+            if show_error:
+                messagebox.showerror("参数错误", f"请检查阈值、光纤宽度、重捕获时间及训练参数。\n{exc}")
+            return False
 
-    def _dynamic_hint(self, key: str) -> str:
-        cfg = self.current_cfg()
-        if key == "pick_video":
-            return str(cfg["video"])
-        if key == "pick_roi":
-            roi = self.roi_path(cfg)
-            return f"已保存: {roi.name}" if roi.is_file() else "未框选 - 点击打开框选窗口"
-        if key == "pick_outdir":
-            return str(self.args.infer_out)
-        name = Path(cfg["video"]).name
-        if key == "screen":
-            if not self.args.screening.is_file():
-                return "未筛选(点运行生成)"
-            rows = self._screening_rows(name)
-            if rows is None:
-                return "该视频无筛选记录"
-            return f"候选 {rows['candidates']} 帧,已排除 {rows['excluded']} 帧"
-        if key == "annotate":
-            rows = self._screening_rows(name)
-            labelled = self._labelled_count(name)
-            if rows is None and labelled is None:
-                return "未标注(需先 ②③)"
-            lab = str(labelled) if labelled is not None else "?"
-            if rows is not None and labelled is not None:
-                return f"已标注 {lab}/{rows['candidates']} 帧,剩 {rows['candidates'] - labelled} 待补充"
-            return f"已标注 {lab} 帧"
-        if key == "prepare":
-            images = self.args.dataset / "images"
-            n = len(list(images.glob("*.png"))) if images.is_dir() else 0
-            if not n:
-                return "未导出(点运行生成)"
-            nv = 0
-            dj = self.args.dataset / "dataset.json"
-            if dj.is_file():
-                try:
-                    nv = len(json.loads(dj.read_text(encoding="utf-8")).get("videos") or [])
-                except (json.JSONDecodeError, OSError):
-                    nv = 0
-            return f"数据集 {n} 对图像/掩码,{nv} 个视频(含背景缓存)"
-        if key == "train":
-            if not self.args.model.is_file():
-                return "未训练(点运行开始)"
-            tj = self.args.model.parent / "training_history.json"
-            if tj.is_file():
-                try:
-                    d = json.loads(tj.read_text(encoding="utf-8"))
-                    bg = "背景无关输入" if d.get("bg_subtract") else "raw 输入"
-                    return f"best_unet.pt Dice {100 * d['best_val_dice']:.1f}% ({bg})"
-                except (json.JSONDecodeError, OSError, KeyError):
-                    pass
-            return "best_unet.pt 已存在"
-        if key == "calibrate":
-            if not self.args.heads.is_file():
-                return "未校准 - 点运行:自动选 20 个低置信度帧"
-            try:
-                n = len(pd.read_csv(self.args.heads))
-            except (OSError, pd.errors.EmptyDataError):
-                n = 0
-            return f"已校准 {n} 条(可随时重跑,会自动重训)"
-        return ""
+    # --------------------------------------------------------------- status
+    @staticmethod
+    def _same_path(left, right) -> bool:
+        try:
+            return os.path.normcase(str(Path(left).resolve())) == os.path.normcase(str(Path(right).resolve()))
+        except OSError:
+            return False
 
-    def _screening_rows(self, video_name: str) -> dict | None:
-        """candidates / excluded counts for one video from screening.csv."""
-        if not self.args.screening.is_file():
-            return None
-        df = pd.read_csv(self.args.screening)
-        rows = df.loc[df.video == video_name]
-        if not len(rows):
-            return None
-        excluded = int(rows.exclude.fillna(False).astype(bool).sum())
-        return {"candidates": int(len(rows)) - excluded, "excluded": excluded}
-
-    def _labelled_count(self, video_name: str) -> int | None:
-        if not self.args.labels.is_file():
-            return None
-        lab = pd.read_csv(self.args.labels)
-        if "video" in lab:
-            lab = lab.loc[lab.video == video_name]
-        if "polygon_px" in lab:
-            lab = lab.loc[lab.polygon_px.notna() & (lab.polygon_px.astype(str).str.strip() != "")]
-        return int(len(lab))
-
-    def annotate_stats(self) -> None:
-        """Per-video annotation status dialog (check / supplement labels)."""
-        win = tk.Toplevel(self.root)
-        win.title("标注统计 - 检查 / 补充标注")
-        win.geometry("820x430")
-        cols = ("video", "cand", "lab", "rem", "excl", "bg")
-        heads = {"video": "视频", "cand": "筛选候选", "lab": "已标注",
-                 "rem": "待补充", "excl": "已排除", "bg": "背景缓存"}
-        tree = ttk.Treeview(win, columns=cols, show="headings")
-        for c in cols:
-            tree.heading(c, text=heads[c])
-            tree.column(c, width=90 if c == "video" else 76,
-                        anchor="w" if c == "video" else "center")
-        tot = {"cand": 0, "lab": 0, "excl": 0, "bg": 0}
-        for cfg in self.videos:
-            name = Path(cfg["video"]).name
-            rows = self._screening_rows(name)
-            labelled = self._labelled_count(name)
-            cand = rows["candidates"] if rows else 0
-            lab = labelled if labelled is not None else 0
-            rem = max(cand - lab, 0)
-            excl = rows["excluded"] if rows else 0
-            stem = Path(cfg["video"]).stem.replace(" ", "_")
-            has_bg = (self.args.dataset / "backgrounds" / f"{stem}.png").is_file()
-            tree.insert("", "end", values=(name, cand, lab, rem, excl, "✓" if has_bg else ""))
-            for k, v in (("cand", cand), ("lab", lab), ("excl", excl)):
-                tot[k] += v
-            tot["bg"] += 1 if has_bg else 0
-        tree.insert("", "end", values=("合计", tot["cand"], tot["lab"],
-                                       max(tot["cand"] - tot["lab"], 0),
-                                       tot["excl"], f"{tot['bg']}/{len(self.videos)}"))
-        tree.pack(fill="both", expand=True, padx=8, pady=(8, 2))
-        note = ttk.Label(win, font=("Microsoft YaHei UI", 9), foreground="#666666",
-                         text="运行 ④ 多边形标注 只会打开未标注的帧,已标注的自动跳过,"
-                              "可以随时点运行补充新标注。")
-        note.pack(padx=8, pady=(0, 4))
-        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
+    def _metadata_matches(self, filename: str) -> bool:
+        path = self.output_path() / filename
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            return self._same_path(meta.get("input", ""), self.cfg()["video"])
+        except (OSError, json.JSONDecodeError):
+            return False
 
     def refresh(self) -> None:
-        # cache status_of per refresh: dependencies re-query the same keys
-        cache: dict[str, str] = {}
+        cfg = self.cfg(); video = Path(cfg["video"]); roi = self.roi_path(cfg)
+        self.roi_summary_var.set(f"ROI: {roi}" if roi.is_file() else "ROI: 未设置")
+        if self._metadata_matches("head_track_metadata.json"):
+            try:
+                meta = json.loads((self.output_path() / "head_track_metadata.json").read_text(encoding="utf-8"))
+                self.analysis_summary_var.set(
+                    f"当前视频已完成：{meta.get('frames', 0)} 帧，头部有效率 {meta.get('head_valid_percent', 0):.1f}%")
+            except (OSError, json.JSONDecodeError):
+                self.analysis_summary_var.set("当前视频结果存在")
+        else:
+            self.analysis_summary_var.set("当前视频尚未完成完整分析")
+        history = self.args.model.parent / "training_history.json"
+        if self.args.model.is_file():
+            try:
+                d = json.loads(history.read_text(encoding="utf-8"))
+                promoted = "已晋升" if d.get("candidate_promoted", True) else "保留旧模型"
+                self.training_summary_var.set(
+                    f"模型可用｜候选 Dice {100 * float(d['best_val_dice']):.1f}%｜{promoted}｜"
+                    f"训练 {d.get('train_count', '?')} / 验证 {d.get('val_count', '?')}")
+            except (OSError, json.JSONDecodeError, KeyError, ValueError):
+                self.training_summary_var.set("模型文件存在")
+        else:
+            self.training_summary_var.set("模型不存在：请先训练或选择 checkpoint")
+        self.root.title(f"Behavior Analyze · U-Net v2 — {video.name}")
 
-        def st(key: str) -> str:
-            if key not in cache:
-                cache[key] = self.status_of(key)
-            return cache[key]
+    # -------------------------------------------------------------- commands
+    def _training_cfgs(self) -> list[dict]:
+        rows = self.videos if self.all_train_var.get() else [self.cfg()]
+        # The project list may also contain inference-only recordings. Do not
+        # let an unlabeled new video block or pollute dataset rebuilding.
+        if self.args.labels.is_file():
+            try:
+                labels = pd.read_csv(self.args.labels)
+                if "video" in labels.columns:
+                    labelled_names = set(labels.loc[
+                        labels.get("polygon_px", pd.Series(index=labels.index, dtype=object)).notna(),
+                        "video"].astype(str))
+                    rows = [row for row in rows if Path(row["video"]).name in labelled_names]
+            except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+                pass
+        return [self.local_cfg(row) for row in rows if Path(row["video"]).is_file()]
 
-        for key, title, hint in TRAIN_STEPS + PROC_STEPS:
-            state = st(key)
-            if state == READY and any(st(d) != DONE for d in DEPENDENCIES.get(key, ())):
-                state = WARN
-            label, badge, hint_label = self.step_rows[key]
-            label.config(text=title)
-            badge.config(text=STATE_TEXT[state], fg=STATE_COLOR[state])
-            hint_label.config(text=self._dynamic_hint(key) if key in _HINT_KEYS else hint)
-        self.root.update_idletasks()
+    def _require_analysis_inputs(self) -> bool:
+        if not Path(self.cfg()["video"]).is_file():
+            messagebox.showerror("视频不存在", str(self.cfg()["video"])); return False
+        if not self.roi_path().is_file():
+            messagebox.showerror("缺少 ROI", "请先点击“框选 ROI”或选择已有 ROI JSON。"); return False
+        if not self.args.model.is_file():
+            messagebox.showerror("缺少模型", "请选择可用的 best_unet.pt，或先在训练页训练。"); return False
+        return True
 
-    # -------------------------------------------------------- commands ---
-    def commands_for(self, key: str) -> list[tuple[Path, list[str]]]:
-        w = f"{self.args.arena_width_cm:.2f}"
-        h = f"{self.args.arena_height_cm:.2f}"
-        self.args.rotate = int(self.rotate_var.get())
-        # UI-settable screening budget: frames picked per video (③) and
-        # newly labelled per annotate run (④). A low budget (default 10)
-        # keeps the manual work small: the picker spreads them across the
-        # whole recording so near-duplicate frames are not selected.
+    def analyze(self) -> None:
+        if not self._sync_args() or not self._require_analysis_inputs():
+            return
+        self.args.infer_out.mkdir(parents=True, exist_ok=True)
+        cmd = R.head_cmd(self.make_v(), {"video": self.cfg()["video"], "roi": self.roi_path()}, self.args)
+        self.run_commands([cmd], "完整分析")
+
+    def mask_preview(self) -> None:
+        if not self._sync_args() or not self.args.model.is_file():
+            messagebox.showerror("缺少模型", "请选择可用的 best_unet.pt。"); return
+        self.args.infer_out.mkdir(parents=True, exist_ok=True)
+        self.run_commands([R.infer_cmd(self.make_v(), self.args)], "仅分割预览")
+
+    def rebuild_dataset(self, train_after: bool = False) -> None:
+        if not self._sync_args():
+            return
+        if not self.args.labels.is_file():
+            messagebox.showerror("缺少标注", f"未找到已有标注：\n{self.args.labels}"); return
+        cfgs = self._training_cfgs()
+        if not cfgs:
+            messagebox.showerror("没有训练视频", "视频列表中没有与标注 CSV 匹配的录像。"); return
+        missing_roi = [Path(c["video"]).name for c in cfgs if not Path(c["roi"]).is_file()]
+        if missing_roi:
+            messagebox.showerror("缺少 ROI", "这些训练视频没有 ROI：\n" + "\n".join(missing_roi)); return
+        w, h = f"{self.args.arena_width_cm:.2f}", f"{self.args.arena_height_cm:.2f}"
+        commands = [R.prepare_cmd(c, w, h, self.args) for c in cfgs]
+        if train_after:
+            self.train_curve.clear(); self.draw_curve()
+            commands.append(R.train_cmd(self.make_v(), self.args))
+        self.run_commands(commands, "重建数据集并训练" if train_after else "重建数据集")
+
+    def train(self) -> None:
+        if not self._sync_args():
+            return
+        if not (self.args.dataset / "dataset.json").is_file():
+            messagebox.showerror("缺少数据集", "请先点击“重建数据集”。"); return
+        self.train_curve.clear(); self.draw_curve()
+        self.run_commands([R.train_cmd(self.make_v(), self.args)], "模型训练")
+
+    def advanced_step(self, key: str) -> None:
+        if not self._sync_args():
+            return
+        cfg = self.local_cfg(self.cfg()); w = f"{self.args.arena_width_cm:.2f}"; h = f"{self.args.arena_height_cm:.2f}"
+        if key != "roi" and not Path(cfg["roi"]).is_file():
+            messagebox.showerror("缺少 ROI", "请先框选当前视频 ROI。"); return
+        if key == "roi": commands = [R.roi_cmd(cfg)]
+        elif key == "compare": commands = [R.compare_cmd(cfg, w, h)]
+        elif key == "screen": commands = [R.screen_cmd(cfg, w, h, self.args)]
+        elif key == "annotate":
+            if not (cfg["compare_out"] / "head_method_comparison.csv").is_file():
+                messagebox.showerror("缺少对比数据", "请先运行“生成传统对比数据”。"); return
+            commands = [R.annotate_cmd(cfg, w, h, self.args)]
+        elif key == "calibrate":
+            if not self.args.model.is_file():
+                messagebox.showerror("缺少模型", "请先训练模型。"); return
+            commands = [R.calibrate_cmd(self.make_v(), cfg, self.args)]
+            commands += [R.prepare_cmd(c, w, h, self.args) for c in self._training_cfgs()]
+            commands += [R.train_cmd(self.make_v(), self.args)]
+        else: return
+        self.run_commands(commands, key)
+
+    def show_annotation_stats(self) -> None:
+        lines = []
         try:
-            self.args.per_video = max(1, min(200, int(self.per_video_var.get())))
-            self.args.max_labels = self.args.per_video
-        except (ValueError, tk.TclError):
-            pass
-        loop = self.all_var.get() and key in LOOP_STEPS
-        cfgs = [self.local_cfg(c) for c in self.videos] if loop else [self.local_cfg(self.current_cfg())]
-        if key == "roi":
-            return [R.roi_cmd(c) for c in cfgs]
-        if key == "compare":
-            return [R.compare_cmd(c, w, h) for c in cfgs]
-        if key == "screen":
-            return [R.screen_cmd(c, w, h, self.args) for c in cfgs]
-        if key == "annotate":
-            return [R.annotate_cmd(c, w, h, self.args) for c in cfgs]
-        if key == "prepare":
-            return [R.prepare_cmd(c, w, h, self.args) for c in cfgs]
-        if key == "train":
-            # UI-settable training settings (轮次 / 学习率)
-            try:
-                self.args.epochs = max(1, int(self.epochs_var.get()))
-            except (ValueError, tk.TclError):
-                pass
-            try:
-                self.args.lr = max(1e-6, float(self.lr_var.get()))
-            except (ValueError, tk.TclError):
-                pass
-            return [R.train_cmd(self.make_v(), self.args)]
-        if key == "calibrate":
-            # ⑦ calibrate on the weakest frames -> on success re-export the
-            # corrected masks (all videos) -> retrain. The chain stops if
-            # nothing was saved (calibrate exits nonzero).
-            cfg = {"video": self.make_v()["video"], "roi": self.roi_path(self.current_cfg()),
-                   "compare_out": Path(self.current_cfg().get("compare_out") or
-                                       R.ROOT / "traditional" / "results" / "basic_recognition" / Path(self.current_cfg()["video"]).stem)}
-            cmds = [R.calibrate_cmd(self.make_v(), cfg, self.args)]
-            for c in [self.local_cfg(c) for c in self.videos]:
-                cmds.append(R.prepare_cmd(c, w, h, self.args))
-            cmds.append(R.train_cmd(self.make_v(), self.args))
-            return cmds
-        if key == "infer":
-            return [R.infer_cmd(self.make_v(), self.args)]
-        if key == "head":
-            cfg = {"video": self.make_v()["video"], "roi": self.roi_path(self.current_cfg())}
-            return [R.head_cmd(self.make_v(), cfg, self.args)]
-        return []
+            labels = pd.read_csv(self.args.labels) if self.args.labels.is_file() else pd.DataFrame()
+            heads = pd.read_csv(self.args.heads) if self.args.heads.is_file() else pd.DataFrame()
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+            messagebox.showerror("标注文件错误", str(exc)); return
+        for cfg in self.videos:
+            name = Path(cfg["video"]).name
+            torso = int((labels.video.astype(str) == name).sum()) if "video" in labels else 0
+            head = int((heads.video.astype(str) == name).sum()) if "video" in heads else 0
+            lines.append(f"{name}\n  torso mask: {torso}    head/reflection: {head}")
+        messagebox.showinfo("现有标注统计", "\n\n".join(lines) if lines else "没有标注记录")
 
-    # ---------------------------------------------------------- running ---
-    def run_scripts(self, cmds: list[tuple[Path, list[str]]], then=None) -> None:
-        if not cmds:
+    def view_annotations(self) -> None:
+        """Open the paginated contact sheet without blocking this GUI."""
+        if not self._sync_args():
             return
-        if self.proc is not None and self.proc.poll() is None:
-            self.log("任务运行中，新任务已忽略（先停止当前任务）。\n")
+        videos = [Path(cfg["video"]) for cfg in self.videos if Path(cfg["video"]).is_file()]
+        if not (self.args.dataset / "images").is_dir() and not self.args.labels.is_file():
+            messagebox.showerror("没有标注", "未找到训练数据集，也未找到多边形标注 CSV。")
             return
-        self.status_var.set(f"运行 {len(cmds)} 个任务 ...")
+        argv = [sys.executable, str(Path(__file__).with_name("view_annotations.py")),
+                "--dataset", str(self.args.dataset), "--labels", str(self.args.labels)]
+        for video in videos:
+            argv.extend(["--video", str(video)])
+        try:
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            subprocess.Popen(argv, creationflags=flags)
+            self.log(f"\n$ {subprocess.list2cmdline(argv)}\n")
+            self.status_var.set("已打开分页标注预览")
+        except OSError as exc:
+            messagebox.showerror("无法打开标注预览", str(exc))
 
-        def worker() -> None:
-            for script, argv in cmds:
-                if not self._exec(script, argv):
-                    break
-            if then is not None:
-                try:
-                    then()
-                except Exception as e:  # noqa: BLE001
-                    self.log(f"ERROR in follow-up: {e}\n")
-            self.root.after(0, lambda: (self.refresh(), self.status_var.set("完成(请查看日志)")))
+    # ---------------------------------------------------------- task runner
+    def run_commands(self, commands: list[tuple[Path, list[str]]], label: str) -> None:
+        if self.running:
+            messagebox.showwarning("任务运行中", "请等待当前任务结束，或点击停止。"); return
+        self._save_state(); self.cancelled = False
+        self.running = True
+        self.command_queue = deque(commands)
+        self.status_var.set(f"{label}：准备运行 {len(commands)} 个任务")
+        self.progress.start(10); self._set_busy(True)
+        self._launch_next()
+
+    def _launch_next(self) -> None:
+        if self.cancelled:
+            self._finish(False, "已停止")
+            return
+        if not self.command_queue:
+            self._finish(True, "完成")
+            return
+        script, argv = self.command_queue.popleft()
+        self.current_script = script
+        self.status_var.set(f"运行：{script.name}（剩余 {len(self.command_queue)}）")
+        pretty = subprocess.list2cmdline([sys.executable, str(script), *argv])
+        self.log(f"\n$ {pretty}\n")
+
+        def worker():
+            try:
+                if self.cancelled:
+                    self.events.put(("done", -15)); return
+                flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                proc = subprocess.Popen(
+                    [sys.executable, "-u", str(script), *argv], cwd=str(R.ROOT),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace",
+                    creationflags=flags)
+                self.proc = proc
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    self.events.put(("log", line))
+                self.events.put(("done", proc.wait()))
+            except Exception as exc:  # noqa: BLE001
+                self.events.put(("error", str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _exec(self, script: Path, argv: list[str]) -> bool:
-        self.log(f"$ python {Path(script).name} {' '.join(argv)}\n")
+    def _poll_events(self) -> None:
         try:
-            self.proc = subprocess.Popen(
-                [sys.executable, "-u", str(script), *argv],  # -u: unbuffered prints
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", cwd=str(R.ROOT))
-            assert self.proc.stdout is not None
-            for line in self.proc.stdout:
-                self.log(line)
-            rc = self.proc.wait()
-            self.proc = None
-            self.log(f"\n--- 退出码 {rc} ---\n")
-            return rc == 0
-        except Exception as e:  # noqa: BLE001
-            self.log(f"ERROR: {e}\n")
-            self.proc = None
-            return False
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "log":
+                    self._append_log(payload)
+                    self._consume_training_json(payload)
+                elif kind == "done":
+                    self.proc = None
+                    self.log(f"--- 退出码 {payload} ---\n")
+                    if self.cancelled:
+                        self._finish(False, "已停止")
+                    elif payload == 1 and self.current_script is not None \
+                            and self.current_script.name == "calibrate_model.py":
+                        self.command_queue.clear()
+                        self._finish(True, "没有实际修改，已跳过重训")
+                    elif payload == 0:
+                        self._launch_next()
+                    else:
+                        self.command_queue.clear(); self._finish(False, f"失败（退出码 {payload}）")
+                elif kind == "error":
+                    self.proc = None; self.command_queue.clear()
+                    self.log(f"ERROR: {payload}\n"); self._finish(False, "启动失败")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_events)
 
-    def log(self, text: str) -> None:
-        self.log_q.append(text)  # deque.append is atomic under the GIL
-
-    def _start_log_pump(self) -> None:
-        def pump() -> None:
-            inserted = 0
-            while inserted < LOG_PUMP_BATCH and self.log_q:
-                try:
-                    line = self.log_q.popleft()
-                except IndexError:  # another thread drained it meanwhile
-                    break
-                self._on_log_line(line)
-                self.log_text.insert(tk.END, line)
-                self.log_lines += line.count("\n")
-                inserted += 1
-            if inserted:
-                self._trim_log()
-                self.log_text.see(tk.END)
-            self.root.after(120, pump)
-        self.root.after(120, pump)
-
-    def _on_log_line(self, line: str) -> None:
-        """train.py streams one JSON line per epoch -> feed the live curve."""
-        if "epoch" not in line or "train_loss" not in line:
-            return
-        try:
-            d = json.loads(line.strip())
-        except json.JSONDecodeError:
-            return
-        if isinstance(d, dict) and "epoch" in d and "train_loss" in d:
-            self.train_curve[int(d["epoch"])] = (float(d["train_loss"]),
-                                                 float(d.get("val_dice", float("nan"))))
-            self._schedule_curve_redraw()
-
-    def _schedule_curve_redraw(self) -> None:
-        now = time.monotonic()
-        if now - self._curve_last_draw >= 0.8:
-            self._curve_last_draw = now
-            self.draw_curve()
-        elif not self._curve_pending:
-            self._curve_pending = True
-            self.root.after(400, self._curve_flush)
-
-    def _curve_flush(self) -> None:
-        self._curve_pending = False
-        self._curve_last_draw = time.monotonic()
-        self.draw_curve()
-
-    # -------------------------------------------------- loss curve ---
-    def draw_curve(self) -> None:
-        """Live training curve, one point per 5 epochs (loss + val dice)."""
-        cv = self.curve_cv
-        cv.delete("all")
-        W = cv.winfo_width() or 880
-        H = cv.winfo_height() or 170
-        if not self.train_curve:
-            cv.create_text(W / 2, H / 2,
-                           text="训练 loss 曲线:运行 ⑥ 后实时显示(每 5 个 epoch 一个点)",
-                           fill="#888888", font=("Microsoft YaHei UI", 10))
-            return
-        epochs = sorted(self.train_curve)
-        # bucket = 5 epochs (average); the partial last bucket is kept so
-        # the curve extends while training is still running.
-        buckets: list[tuple[int, float, float]] = []
-        for b in range(5, epochs[-1] + 1, 5):
-            sel = [self.train_curve[e] for e in epochs if b - 4 <= e <= b]
-            if sel:
-                dices = [d for _, d in sel if d == d]  # drop NaN
-                buckets.append((b, sum(l for l, _ in sel) / len(sel),
-                                sum(dices) / len(dices) if dices else float("nan")))
-        tail = epochs[-1]
-        if tail % 5:
-            sel = [self.train_curve[e] for e in epochs if e > tail - tail % 5]
-            if sel:
-                dices = [d for _, d in sel if d == d]
-                buckets.append((tail, sum(l for l, _ in sel) / len(sel),
-                                sum(dices) / len(dices) if dices else float("nan")))
-        xs = [b[0] for b in buckets]
-        losses = [b[1] for b in buckets]
-        dices = [(b[0], b[2]) for b in buckets if b[2] == b[2]]
-        panel_h = (H - 12) // 2
-        self._chart_panel(cv, 6, 4, W - 8, 6 + panel_h, xs, losses,
-                          f"train loss (每 5 epoch 一点)  epoch {epochs[-1]}/{self.args.epochs}",
-                          "#0b57d0")
-        self._chart_panel(cv, 6, 10 + panel_h, W - 8, H - 4, [p[0] for p in dices],
-                          [p[1] for p in dices], "val dice", "#1a7f37")
-
-    def _chart_panel(self, cv: tk.Canvas, x0: int, y0: int, x1: int, y1: int,
-                     xs: list[int], values: list[float], label: str, color: str) -> None:
-        cv.create_rectangle(x0, y0, x1, y1, outline="#d0d0d0")
-        cv.create_text(x0 + 6, y0 + 4, anchor="nw", text=label,
-                       font=("Microsoft YaHei UI", 9), fill="#444444")
-        if len(values) < 1:
-            return
-        vmin, vmax = min(values), max(values)
-        if vmax - vmin < 1e-9:
-            vmax = vmin + 1.0
-        pad = (vmax - vmin) * 0.15
-        vmin, vmax = vmin - pad, vmax + pad
-        rng_x = max(xs[-1] - xs[0], 1)
-
-        def px(e: int) -> float:
-            return x0 + 10 + (e - xs[0]) / rng_x * (x1 - x0 - 20)
-
-        def py(v: float) -> float:
-            return y1 - 12 - (v - vmin) / (vmax - vmin) * (y1 - y0 - 42)
-
-        for f in (0.0, 0.5, 1.0):
-            v = vmin + f * (vmax - vmin)
-            gy = py(v)
-            cv.create_line(x0 + 8, gy, x1 - 8, gy, fill="#eeeeee")
-            cv.create_text(x0 + 4, gy, anchor="e", text=f"{v:.4g}",
-                           fill="#999999", font=("Consolas", 7))
-        step = max(1, rng_x // 4)
-        for e in range(xs[0], xs[-1] + 1, step):
-            cv.create_text(px(e), y1 - 4, anchor="n", text=str(e),
-                           fill="#999999", font=("Consolas", 7))
-        pts: list[float] = []
-        for e, v in zip(xs, values):
-            pts += [px(e), py(v)]
-        if len(pts) >= 4:
-            cv.create_line(*pts, fill=color, width=2, smooth=True)
-
-    def _trim_log(self) -> None:
-        """Keep the widget bounded: drop the oldest lines past LOG_MAX_LINES."""
-        excess = self.log_lines - LOG_MAX_LINES
-        if excess > 0:
-            self.log_text.delete("1.0", f"{excess + 1}.0")
-            self.log_lines -= excess
+    def _finish(self, success: bool, text: str) -> None:
+        self.command_queue.clear(); self.progress.stop(); self.running = False
+        self.current_script = None; self._set_busy(False)
+        self.status_var.set(text); self.refresh(); self._save_state()
+        if not success and not self.cancelled:
+            messagebox.showerror("任务失败", "请查看下方日志中的最后一个 ERROR/Traceback。")
 
     def stop(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.terminate()
-            self.log("\n--- 已请求停止 ---\n")
+        self.cancelled = True; self.command_queue.clear()
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                self.log("\n--- 已请求停止当前子进程 ---\n")
+            except OSError as exc:
+                self.log(f"停止失败: {exc}\n")
+        elif not self.running:
+            self._finish(False, "已停止")
+        else:
+            self.status_var.set("正在停止启动中的任务…")
 
-    def pick_video(self) -> None:
-        f = filedialog.askopenfilename(
-            title="选择要处理的视频", initialdir=str(R.ROOT / "data"),
-            filetypes=[("视频", "*.avi *.mp4 *.mov *.mkv")])
-        if not f:
-            return
-        v = Path(f)
-        for idx, cfg in enumerate(self.videos):
-            if Path(cfg["video"]) == v:
-                self.current = idx
-                self._fill_video_combo()
-                self.refresh()
-                return
-        self.videos.append({"video": v, "roi": "", "compare_out": ""})
+    def _set_busy(self, busy: bool) -> None:
+        for button in self.action_buttons:
+            button.configure(state="disabled" if busy else "normal")
+        self.stop_button.configure(state="normal" if busy else "disabled")
+
+    # ----------------------------------------------------------- video/path
+    def add_video(self) -> None:
+        filename = filedialog.askopenfilename(title="添加视频", initialdir=str(R.ROOT / "data"),
+                                              filetypes=[("视频", "*.avi *.mp4 *.mov *.mkv")])
+        if not filename: return
+        video = Path(filename)
+        for index, cfg in enumerate(self.videos):
+            if self._same_path(cfg["video"], video):
+                self.current = index; self._fill_video_combo(); self._select_current(); return
+        self.videos.append({"video": video, "roi": Path(""), "compare_out": Path(""),
+                            "output": R.ROOT / "results" / f"{video.stem}_unet"})
         self.current = len(self.videos) - 1
-        self._fill_video_combo()
-        self._save_videos()  # added videos survive UI restarts
-        self.refresh()
-        if not self.roi_path(self.current_cfg()).is_file():
-            self.status_var.set("新视频缺少区域框选,自动打开框选窗口 ...")
-            self.run_scripts([R.roi_cmd(self.current_cfg())])
+        self._fill_video_combo(); self._select_current(); self._save_state()
 
-    def pick_roi(self) -> None:
-        cfg = self.current_cfg()
-        roi = self.roi_path(cfg)
-        if roi.is_file() and not messagebox.askyesno(
-                "重新框选?", f"当前视频已有 ROI:\n{roi.name}\n\n重新框选?"):
+    def remove_video(self) -> None:
+        if len(self.videos) <= 1:
+            messagebox.showinfo("不能移除", "列表中至少保留一个视频。"); return
+        if not messagebox.askyesno("移除视频", "仅从 UI 列表移除，不删除原视频和结果。继续吗？"):
             return
-        self.status_var.set("区域框选 ...")
-        self.run_scripts([R.roi_cmd(cfg)])
+        self.videos.pop(self.current); self.current = min(self.current, len(self.videos) - 1)
+        self._fill_video_combo(); self._select_current(); self._save_state()
 
-    def pick_outdir(self) -> None:
-        d = filedialog.askdirectory(title="选择输出文件夹", initialdir=str(self.args.infer_out))
-        if d:
-            self.args.infer_out = Path(d)
-            self.refresh()
+    def choose_roi_file(self) -> None:
+        filename = filedialog.askopenfilename(title="选择 ROI JSON", initialdir=str(R.ROOT / "traditional" / "basic_rois"),
+                                              filetypes=[("JSON", "*.json")])
+        if filename:
+            self.cfg()["roi"] = Path(filename); self.refresh(); self._save_state()
 
-    def run_step(self, key: str) -> None:
-        if key == "pick_video":
-            self.pick_video()
-            return
-        if key == "pick_roi":
-            self.pick_roi()
-            return
-        if key == "pick_outdir":
-            self.pick_outdir()
-            return
-        if key == "train":
-            self.train_curve.clear()  # fresh curve for every training run
-        if self.proc is not None and self.proc.poll() is None:
-            messagebox.showwarning("任务运行中", "当前任务尚未结束，请先停止或等待完成。")
-            return
-        missing = [d for d in DEPENDENCIES.get(key, ()) if self.status_of(d) != DONE]
-        if missing and not messagebox.askyesno(
-                "依赖缺失",
-                f"推荐先完成:{'、'.join(missing)}\n仍要运行 {key} 吗?"):
-            return
-        if key == "head" and not self.roi_path(self.current_cfg()).is_file():
-            if not messagebox.askyesno("缺少 ROI", "当前视频没有 ROI JSON,先打开四角标注窗口?"):
-                return
-            self.status_var.set("ROI 标注 ...")
-            self.run_scripts([R.roi_cmd(self.current_cfg())],
-                             then=lambda: self._head_after_roi())
-            return
-        cmds = self.commands_for(key)
-        self.run_scripts(cmds)
+    def choose_model(self) -> None:
+        filename = filedialog.askopenfilename(title="选择模型", initialdir=str(self.args.model.parent),
+                                              filetypes=[("PyTorch checkpoint", "*.pt")])
+        if filename:
+            self.model_var.set(filename); self._sync_args(False); self.refresh(); self._save_state()
 
-    def _head_after_roi(self) -> None:
-        if not self.roi_path(self.current_cfg()).is_file():
-            self.log("ROI 标注未保存,取消 head 任务。\n")
-            return
-        self.run_scripts(self.commands_for("head"))
+    def choose_output(self) -> None:
+        directory = filedialog.askdirectory(title="选择当前视频输出目录", initialdir=str(self.output_path()))
+        if directory:
+            self.output_var.set(directory); self.cfg()["output"] = Path(directory)
+            self._sync_args(False); self.refresh(); self._save_state()
 
-    # -------------------------------------------------------------- ui ---
+    def choose_dataset(self) -> None:
+        directory = filedialog.askdirectory(title="选择训练数据集目录", initialdir=str(self.args.dataset))
+        if directory:
+            self.dataset_var.set(directory); self._sync_args(False); self.refresh(); self._save_state()
+
+    def open_path(self, path: Path) -> None:
+        target = path if path.exists() else path.parent
+        if not target.exists():
+            messagebox.showinfo("尚无产物", str(path)); return
+        try:
+            os.startfile(str(target))  # type: ignore[attr-defined]
+        except OSError as exc:
+            messagebox.showerror("无法打开", str(exc))
+
     def _fill_video_combo(self) -> None:
-        names = [Path(c["video"]).name for c in self.videos]
+        names = [Path(v["video"]).name for v in self.videos]
         self.video_combo["values"] = names
+        self.video_combo.current(self.current)
         self.video_var.set(names[self.current])
 
-    def _on_video_change(self, _event=None) -> None:
-        try:
-            self.current = int(self.video_combo.current())
-        except ValueError:
-            self.current = 0
-        self.refresh()
+    def _select_current(self, _event=None) -> None:
+        selected = self.video_combo.current()
+        if selected >= 0: self.current = selected
+        self.output_var.set(str(self.output_path()))
+        self.args.infer_out = self.output_path()
+        self._sync_args(show_error=False)
+        self.refresh(); self._save_state()
 
-    def _step_row(self, parent, key: str, title: str, hint: str) -> None:
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=3)
-        label = ttk.Label(row, text=title, font=FONT, width=18, anchor="w")
-        label.pack(side="left")
-        hint_label = ttk.Label(row, text=hint, font=("Microsoft YaHei UI", 9),
-                               foreground="#666666", anchor="w")
-        hint_label.pack(side="left", fill="x", expand=True)
-        badge = tk.Label(row, text="○ 待运行", font=FONT, width=10,
-                         anchor="center",
-                         bg=ttk.Style().lookup("TFrame", "background"))
-        badge.pack(side="right", padx=(4, 0))
-        ttk.Button(row, text="运行", width=8,
-                   command=lambda k=key: self.run_step(k)).pack(side="right", padx=4)
-        self.step_rows[key] = (label, badge, hint_label)
+    # --------------------------------------------------------------- logging
+    def log(self, text: str) -> None:
+        self.events.put(("log", text))
+
+    def _append_log(self, text: str) -> None:
+        self.log_text.insert(tk.END, text); self.log_lines += text.count("\n")
+        if self.log_lines > LOG_MAX_LINES:
+            excess = self.log_lines - LOG_MAX_LINES
+            self.log_text.delete("1.0", f"{excess + 1}.0"); self.log_lines -= excess
+        self.log_text.see(tk.END)
+
+    def _consume_training_json(self, line: str) -> None:
+        if '"epoch"' not in line or '"train_loss"' not in line: return
+        try: row = json.loads(line.strip())
+        except json.JSONDecodeError: return
+        self.train_curve[int(row["epoch"])] = (float(row["train_loss"]), float(row["val_dice"]))
+        self.draw_curve()
+
+    def draw_curve(self) -> None:
+        cv = self.curve; cv.delete("all"); width = max(cv.winfo_width(), 400); height = 145
+        if not self.train_curve:
+            cv.create_text(width / 2, height / 2, text="训练时实时显示 loss / validation Dice",
+                           fill="#777", font=SMALL); return
+        epochs = sorted(self.train_curve); values = [self.train_curve[e] for e in epochs]
+        for panel, index, title, color in ((0, 0, "Loss", "#1f5ea8"), (1, 1, "Val Dice", "#18864b")):
+            y0 = 5 + panel * 70; y1 = y0 + 62
+            cv.create_rectangle(42, y0, width - 8, y1, outline="#d0d6dc")
+            series = [v[index] for v in values]; lo, hi = min(series), max(series)
+            if hi - lo < 1e-9: hi = lo + 1
+            points = []
+            for j, value in enumerate(series):
+                x = 44 + j / max(len(series) - 1, 1) * (width - 55)
+                y = y1 - 5 - (value - lo) / (hi - lo) * 45
+                points += [x, y]
+            if len(points) >= 4: cv.create_line(*points, fill=color, width=2)
+            cv.create_text(5, y0 + 4, anchor="nw", text=title, fill=color, font=SMALL)
+            cv.create_text(width - 12, y0 + 4, anchor="ne", text=f"epoch {epochs[-1]}", fill="#666", font=SMALL)
+
+    # ------------------------------------------------------------------- UI
+    def _button(self, parent, text, command, **kwargs):
+        button = ttk.Button(parent, text=text, command=command, **kwargs)
+        self.action_buttons.append(button); return button
+
+    def _path_row(self, parent, label, variable, choose, open_command=None):
+        row = ttk.Frame(parent); row.pack(fill="x", pady=3)
+        ttk.Label(row, text=label, width=12, font=FONT).pack(side="left")
+        ttk.Entry(row, textvariable=variable, font=SMALL).pack(side="left", fill="x", expand=True, padx=4)
+        self._button(row, "选择", choose, width=7).pack(side="left")
+        if open_command: self._button(row, "打开", open_command, width=7).pack(side="left", padx=(4, 0))
 
     def _build_ui(self) -> None:
-        root = self.root
-        root.title("run_unet 流程向导")
-        root.geometry("1040x760")
-        root.minsize(900, 640)
+        root = self.root; root.geometry("1120x860"); root.minsize(960, 720)
+        style = ttk.Style(); style.configure("Primary.TButton", font=("Microsoft YaHei UI", 11, "bold"))
 
-        nb = ttk.Notebook(root)
-        tab_train = ttk.Frame(nb)
-        tab_proc = ttk.Frame(nb)
-        nb.add(tab_train, text=" 训练模式 ")
-        nb.add(tab_proc, text=" 处理模式 ")
-        nb.pack(fill="both", expand=True, padx=8, pady=(6, 0))
+        header = ttk.Frame(root); header.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(header, text="Behavior Analyze · Fibre-aware U-Net", font=("Microsoft YaHei UI", 15, "bold")).pack(side="left")
+        ttk.Label(header, textvariable=self.status_var, foreground="#165d9c", font=FONT).pack(side="left", padx=18)
+        self.progress = ttk.Progressbar(header, mode="indeterminate", length=180); self.progress.pack(side="left", padx=6)
+        self.stop_button = ttk.Button(header, text="停止任务", command=self.stop, state="disabled"); self.stop_button.pack(side="right")
 
-        for spec in TRAIN_STEPS:
-            self._step_row(tab_train, *spec)
-        stat_row = ttk.Frame(tab_train)
-        stat_row.pack(fill="x", pady=(4, 0))
-        ttk.Button(stat_row, text="标注统计(检查/补充)",
-                   command=self.annotate_stats).pack(side="left")
-        ttk.Label(stat_row, text="已标注的帧不会重复标注,可随时再点 ④ 补充新的",
-                  font=("Microsoft YaHei UI", 9), foreground="#666666").pack(side="left", padx=8)
-        set_row = ttk.Frame(tab_train)
-        set_row.pack(fill="x", pady=(4, 0))
-        ttk.Label(set_row, text="训练设置:", font=FONT).pack(side="left")
-        ttk.Label(set_row, text="轮次", font=FONT).pack(side="left", padx=(8, 2))
-        ttk.Spinbox(set_row, from_=1, to=2000, textvariable=self.epochs_var,
-                    width=6, font=FONT).pack(side="left")
-        ttk.Label(set_row, text="学习率", font=FONT).pack(side="left", padx=(8, 2))
-        ttk.Entry(set_row, textvariable=self.lr_var, width=8, font=FONT).pack(side="left")
-        ttk.Label(set_row, text="每视频标注帧数", font=FONT).pack(side="left", padx=(8, 2))
-        ttk.Spinbox(set_row, from_=1, to=100, textvariable=self.per_video_var,
-                    width=4, font=FONT).pack(side="left")
-        ttk.Label(set_row, text="(batch 固定 8; ⑦ 校准帧数 20)",
-                  font=("Microsoft YaHei UI", 9), foreground="#666666").pack(side="left", padx=8)
-        self.curve_cv = tk.Canvas(tab_train, height=170, bg="#fbfbfb",
-                                  highlightthickness=1, highlightbackground="#d0d0d0")
-        self.curve_cv.pack(fill="x", pady=(6, 0))
-        self.curve_cv.bind("<Configure>", lambda _e: self.draw_curve())
-        ttk.Separator(tab_train).pack(fill="x", pady=6)
-        for spec in PROC_STEPS:
-            self._step_row(tab_proc, *spec)
-        rot_row = ttk.Frame(tab_proc)
-        rot_row.pack(fill="x", pady=6)
-        ttk.Label(rot_row, text="画面旋转校正:", font=FONT).pack(side="left")
-        self.rotate_combo = ttk.Combobox(rot_row, textvariable=self.rotate_var, state="readonly",
-                                         values=[0, 90, 180, 270], width=6, font=FONT)
-        self.rotate_combo.pack(side="left", padx=4)
-        ttk.Label(rot_row, text="(旷场相对训练视频转了 90/180/270° 时选择,推理时先把画面转正再分割)",
-                  font=("Microsoft YaHei UI", 9), foreground="#666666").pack(side="left")
+        bar = ttk.LabelFrame(root, text="项目视频"); bar.pack(fill="x", padx=10, pady=4)
+        self.video_combo = ttk.Combobox(bar, textvariable=self.video_var, state="readonly", width=55, font=FONT)
+        self.video_combo.pack(side="left", padx=6, pady=6); self.video_combo.bind("<<ComboboxSelected>>", self._select_current)
+        self._button(bar, "添加视频", self.add_video).pack(side="left", padx=3)
+        self._button(bar, "移出列表", self.remove_video).pack(side="left", padx=3)
+        ttk.Label(bar, textvariable=self.roi_summary_var, foreground="#666", font=SMALL).pack(side="left", padx=10)
 
-        # video bar (shared)
-        bar = ttk.Frame(root)
-        bar.pack(fill="x", padx=8, pady=4)
-        ttk.Label(bar, text="当前视频:", font=FONT).pack(side="left")
-        self.video_combo = ttk.Combobox(bar, textvariable=self.video_var,
-                                        state="readonly", width=52, font=FONT)
-        self.video_combo.pack(side="left", padx=4)
-        self.video_combo.bind("<<ComboboxSelected>>", self._on_video_change)
-        ttk.Checkbutton(bar, text="循环步骤应用到全部视频", variable=self.all_var,
-                        command=self.refresh).pack(side="left", padx=10)
-        ttk.Button(bar, text="刷新状态", command=self.refresh).pack(side="right", padx=4)
-        ttk.Button(bar, text="停止任务", command=self.stop).pack(side="right", padx=4)
+        tabs = ttk.Notebook(root); tabs.pack(fill="both", expand=True, padx=10, pady=4)
+        analyze_tab = ttk.Frame(tabs); train_tab = ttk.Frame(tabs); annotation_tab = ttk.Frame(tabs)
+        tabs.add(analyze_tab, text="  一键分析  "); tabs.add(train_tab, text="  使用已有标注训练  "); tabs.add(annotation_tab, text="  高级标注工具  ")
 
-        # status + log
-        bottom = ttk.Frame(root)
-        bottom.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        top = ttk.Frame(bottom)
-        top.pack(fill="x")
-        ttk.Label(top, textvariable=self.status_var, font=FONT,
-                  foreground="#0b57d0").pack(side="left")
-        ttk.Label(top, text="(依赖缺失的步骤点运行会先询问)", font=("Microsoft YaHei UI", 9),
-                  foreground="#666666").pack(side="right")
-        self.log_text = tk.Text(bottom, height=14, font=("Consolas", 9),
-                                bg="#101418", fg="#d6e0e8", wrap="word")
-        self.log_text.pack(fill="both", expand=True, pady=(4, 0))
+        paths = ttk.LabelFrame(analyze_tab, text="当前分析项目"); paths.pack(fill="x", padx=8, pady=8)
+        roi_row = ttk.Frame(paths); roi_row.pack(fill="x", pady=3)
+        ttk.Label(roi_row, text="竞技场 ROI", width=12, font=FONT).pack(side="left")
+        ttk.Label(roi_row, textvariable=self.roi_summary_var, font=SMALL, foreground="#555").pack(side="left", fill="x", expand=True)
+        self._button(roi_row, "框选 ROI", lambda: self.advanced_step("roi")).pack(side="right", padx=3)
+        self._button(roi_row, "选择 JSON", self.choose_roi_file).pack(side="right", padx=3)
+        self._path_row(paths, "模型", self.model_var, self.choose_model,
+                       lambda: self.open_path(Path(self.model_var.get()).parent))
+        self._path_row(paths, "输出目录", self.output_var, self.choose_output,
+                       lambda: self.open_path(Path(self.output_var.get())))
+
+        params = ttk.LabelFrame(analyze_tab, text="光纤与时间约束参数"); params.pack(fill="x", padx=8, pady=4)
+        for text, variable, width in (("概率阈值", self.threshold_var, 7), ("光纤开运算", self.fibre_var, 5),
+                                      ("重捕获秒数", self.reacquire_var, 6)):
+            ttk.Label(params, text=text, font=FONT).pack(side="left", padx=(8, 2), pady=7)
+            ttk.Entry(params, textvariable=variable, width=width, font=FONT).pack(side="left")
+        ttk.Label(params, text="画面旋转", font=FONT).pack(side="left", padx=(12, 2))
+        ttk.Combobox(params, textvariable=self.rotate_var, values=[0, 90, 180, 270], state="readonly", width=5).pack(side="left")
+        ttk.Label(params, text="建议：阈值 0.5；细光纤 5，粗光纤 7；重捕获 0.35 s",
+                  font=SMALL, foreground="#666").pack(side="left", padx=12)
+
+        action = ttk.Frame(analyze_tab); action.pack(fill="x", padx=8, pady=10)
+        self._button(action, "一键完整分析", self.analyze, style="Primary.TButton", width=18).pack(side="left")
+        self._button(action, "仅导出分割预览", self.mask_preview, width=16).pack(side="left", padx=8)
+        self._button(action, "打开 Mask 视频", lambda: self.open_path(self.output_path() / "mouse_miniscope_mask.mp4")).pack(side="left", padx=3)
+        self._button(action, "打开结果视频", lambda: self.open_path(self.output_path() / "head_track_overlay.mp4")).pack(side="left", padx=3)
+        ttk.Label(analyze_tab, textvariable=self.analysis_summary_var, font=FONT, foreground="#176b3a").pack(anchor="w", padx=12)
+        ttk.Label(analyze_tab, text="完整分析只解码视频一次，同时输出 mask、头/身体叠加视频、轨迹 CSV 和元数据。",
+                  font=SMALL, foreground="#555").pack(anchor="w", padx=12, pady=5)
+
+        quick_train = ttk.LabelFrame(train_tab, text="常用入口 · 直接复用全部已有标注")
+        quick_train.pack(fill="x", padx=8, pady=8)
+        ttk.Label(quick_train,
+                  text="全量同步 CSV → 清理失效样本 → 热启动旧模型 → 训练并验证；不需要重新逐帧打标。",
+                  font=FONT, foreground="#263746").pack(anchor="w", padx=10, pady=(8, 5))
+        quick_actions = ttk.Frame(quick_train); quick_actions.pack(fill="x", padx=10, pady=(0, 10))
+        self._button(quick_actions, "一键重建数据集并训练", lambda: self.rebuild_dataset(True),
+                     style="Primary.TButton", width=24).pack(side="left")
+        self._button(quick_actions, "拼接查看已标注数据", self.view_annotations,
+                     width=22).pack(side="left", padx=8)
+        ttk.Label(quick_actions, text="每页 20 张；←/→ 翻页", font=SMALL,
+                  foreground="#666").pack(side="left", padx=4)
+
+        train_info = ttk.LabelFrame(train_tab, text="训练设置"); train_info.pack(fill="x", padx=8, pady=4)
+        ttk.Label(train_info, text="程序会从 CSV 全量同步数据集、清除旧样本、复用旧模型权重，并仅在验证不退化时晋升候选模型。",
+                  font=SMALL, foreground="#444").pack(anchor="w", padx=8, pady=6)
+        self._path_row(train_info, "数据集目录", self.dataset_var, self.choose_dataset,
+                       lambda: self.open_path(Path(self.dataset_var.get())))
+        train_set = ttk.Frame(train_info); train_set.pack(fill="x", padx=6, pady=5)
+        for text, variable, width in (("Epoch", self.epochs_var, 6), ("Batch", self.batch_var, 5),
+                                      ("学习率", self.lr_var, 8)):
+            ttk.Label(train_set, text=text, font=FONT).pack(side="left", padx=(6, 2))
+            ttk.Entry(train_set, textvariable=variable, width=width).pack(side="left")
+        ttk.Checkbutton(train_set, text="使用列表中全部视频", variable=self.all_train_var).pack(side="left", padx=14)
+        train_actions = ttk.Frame(train_tab); train_actions.pack(fill="x", padx=8, pady=4)
+        self._button(train_actions, "仅重建数据集", self.rebuild_dataset, width=15).pack(side="left")
+        self._button(train_actions, "仅训练", self.train, width=12).pack(side="left", padx=6)
+        self._button(train_actions, "拼接查看训练样本", self.view_annotations, width=18).pack(side="left")
+        ttk.Label(train_tab, textvariable=self.training_summary_var, font=FONT, foreground="#176b3a").pack(anchor="w", padx=12, pady=5)
+        self.curve = tk.Canvas(train_tab, height=145, bg="#fafbfc", highlightthickness=1,
+                               highlightbackground="#ccd3da"); self.curve.pack(fill="x", padx=8, pady=5)
+        self.curve.bind("<Configure>", lambda _e: self.draw_curve())
+
+        warning = ttk.LabelFrame(annotation_tab, text="高级工具：只有出现新的失败类型时才使用")
+        warning.pack(fill="x", padx=8, pady=8)
+        ttk.Label(warning, text="不要把“校准并重训”当成常规循环。已校准帧会跳过，未实际编辑则不会触发重训。",
+                  foreground="#9a4d00", font=FONT).pack(anchor="w", padx=8, pady=6)
+        advanced = ttk.Frame(annotation_tab); advanced.pack(fill="x", padx=8, pady=6)
+        self._button(advanced, "生成传统对比数据", lambda: self.advanced_step("compare")).pack(side="left", padx=3)
+        self._button(advanced, "筛选新帧", lambda: self.advanced_step("screen")).pack(side="left", padx=3)
+        self._button(advanced, "补充多边形标注", lambda: self.advanced_step("annotate")).pack(side="left", padx=3)
+        self._button(advanced, "校准并重训", lambda: self.advanced_step("calibrate")).pack(side="left", padx=3)
+        self._button(advanced, "查看标注统计", self.show_annotation_stats).pack(side="left", padx=3)
+        ttk.Label(annotation_tab, text="每视频最多新增帧数", font=FONT).pack(anchor="w", padx=12, pady=(10, 2))
+        ttk.Spinbox(annotation_tab, from_=1, to=100, textvariable=self.per_video_var, width=6).pack(anchor="w", padx=12)
+
+        log_frame = ttk.LabelFrame(root, text="任务日志"); log_frame.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        log_bar = ttk.Frame(log_frame); log_bar.pack(fill="x")
+        ttk.Button(log_bar, text="清空日志", command=lambda: (self.log_text.delete("1.0", tk.END), setattr(self, "log_lines", 0))).pack(side="right", padx=4)
+        self.log_text = tk.Text(log_frame, height=12, font=("Consolas", 9), bg="#101419", fg="#d7e0e7", wrap="word")
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
+        self.draw_curve()
+
+    def close(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            if not messagebox.askyesno("任务仍在运行", "关闭会终止当前任务。确定关闭吗？"):
+                return
+            self.stop()
+        self._save_state(); self.root.destroy()
 
 
 def main() -> None:
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    root = tk.Tk(); App(root); root.mainloop()
 
 
 if __name__ == "__main__":

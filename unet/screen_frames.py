@@ -204,9 +204,14 @@ def main() -> None:
                 lab = lab.loc[lab.video == vp.name]
             done = {int(f) for f in lab.loc[~lab.exclude.fillna(False).astype(bool)].frame.astype(int)}
             before = len(good)
-            good = [g for g in good if g[0] not in done]
+            # Exact-frame skipping is insufficient for video: frame f+1 can
+            # look identical to labelled frame f. Keep at least about one
+            # second (or 1/25 of a selection bin) away from every old label.
+            novelty_gap = max(1, round(fps), total // max(1, a.per_video * 25))
+            good = [g for g in good if all(abs(g[0] - f) >= novelty_gap for f in done)]
             if done:
-                print(f"      skipping {before - len(good)} already-labelled frames", flush=True)
+                print(f"      skipping {before - len(good)} frames equal/near existing labels "
+                      f"(gap {novelty_gap})", flush=True)
         if not good:
             print(f"      no new candidates for {vp.name}: every screened frame is already labelled", flush=True)
             continue

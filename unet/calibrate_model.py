@@ -19,7 +19,8 @@ Saved corrections:
     -- the caller then re-runs prepare + train, so the retrain learns the
     corrected masks;
   * head/reflection anchors are stored in cm in the rectified arena
-    (--heads) as ground truth for the head pipeline.
+    (--heads); prepare_dataset.py converts head anchors to heatmaps used by
+    the multi-task U-Net.
 
 Exit code 0 = at least one correction was saved (retraining is worth it).
 """
@@ -27,8 +28,9 @@ from __future__ import annotations
 import argparse, json, sys
 from pathlib import Path
 import cv2, numpy as np, pandas as pd, torch
-from model import UNet
-from preprocess import estimate_background, bg_centered
+from model import checkpoint_model
+from preprocess import estimate_background
+from postprocess import model_input
 
 ROOT = Path(__file__).resolve().parents[1]
 CODE = ROOT / "traditional" / "code"
@@ -64,7 +66,7 @@ def simplify(points: np.ndarray, count: int = POLY_SIMPLIFY) -> np.ndarray:
 
 def load_labels(path: Path) -> pd.DataFrame:
     if not path.is_file():
-        return pd.DataFrame(columns=["frame", "polygon_px", "exclude", "video"])
+        return pd.DataFrame(columns=["frame", "polygon_px", "exclude", "video", "source"])
     df = pd.read_csv(path)
     for c in ("frame", "polygon_px", "exclude", "video"):
         if c not in df:
@@ -74,7 +76,7 @@ def load_labels(path: Path) -> pd.DataFrame:
 
 def load_heads(path: Path) -> pd.DataFrame:
     cols = ["frame", "timestamp_sec", "head_x_cm", "head_y_cm", "reflection_x_cm",
-            "reflection_y_cm", "exclude", "reflection_present", "head_present", "video"]
+            "reflection_y_cm", "exclude", "reflection_present", "head_present", "video", "source"]
     if not path.is_file():
         return pd.DataFrame(columns=cols)
     df = pd.read_csv(path)
@@ -99,6 +101,7 @@ class Calibrator:
         self.i = 0
         self.drag: tuple[str, int] | None = None
         self.dirty = False
+        self.saved_count = 0
         self.title = "Model calibration: polygon / HEAD / REFLECTION (S save, Q quit)"
 
     # ---- per-frame editable state ----------------------------------------
@@ -163,7 +166,7 @@ class Calibrator:
             if kind == "poly":
                 self.drag = ("poly", idx)
             elif kind in ("head", "ref"):
-                st[kind] = (float(x), float(y)); self.drag = (kind, -1); self.dirty = True
+                st[kind] = (float(x), float(y)); self.drag = (kind, -1); self.dirty = True; st["edited"] = True
             else:
                 # click on empty space: add a polygon vertex on the nearest edge
                 poly = st["poly"]
@@ -173,13 +176,13 @@ class Calibrator:
                     t = np.clip(np.sum(q * edges, axis=1) / np.maximum(np.sum(edges * edges, axis=1), 1e-6), 0, 1)
                     d = np.linalg.norm(q - edges * t[:, None], axis=1)
                     st["poly"] = np.insert(poly, int(d.argmin()) + 1, [x, y], axis=0)
-                    self.dirty = True
+                    self.dirty = True; st["edited"] = True
         elif event == cv2.EVENT_MOUSEMOVE and self.drag is not None:
             kind, idx = self.drag
             if kind == "poly":
-                st["poly"][idx] = [x, y]; self.dirty = True
+                st["poly"][idx] = [x, y]; self.dirty = True; st["edited"] = True
             else:
-                st[kind] = (float(x), float(y)); self.dirty = True
+                st[kind] = (float(x), float(y)); self.dirty = True; st["edited"] = True
         elif event == cv2.EVENT_LBUTTONUP:
             self.drag = None
 
@@ -219,22 +222,25 @@ class Calibrator:
         st = self.state()
         base = self.caps.get(f, {}).get("reset")
         if base is not None:
-            st["poly"] = base.copy(); self.dirty = True
+            st["poly"] = base.copy(); self.dirty = True; st["edited"] = True
 
     def thin(self) -> None:
         st = self.state()
         if st["poly"] is not None and len(st["poly"]) > POLY_SIMPLIFY:
-            st["poly"] = simplify(st["poly"], POLY_SIMPLIFY); self.dirty = True
+            st["poly"] = simplify(st["poly"], POLY_SIMPLIFY); self.dirty = True; st["edited"] = True
 
     def save(self) -> int:
         """Write polygon + head corrections; return number of rows saved."""
         video = Path(self.args.video).name
         rows_poly, rows_head = [], []
         for frame, st in self.caps.items():
+            if not st.get("edited", False):
+                continue
             if st["poly"] is not None:
                 rows_poly.append({"frame": frame,
                                   "polygon_px": json.dumps(st["poly"].round(1).tolist()),
-                                  "exclude": bool(st["exclude"]), "video": video})
+                                  "exclude": bool(st["exclude"]), "video": video,
+                                  "source": "model_calibration"})
             head = st.get("head"); ref = st.get("ref")
             if head is not None or ref is not None:
                 hx, hy = self.px_to_cm(head) if head is not None else (np.nan, np.nan)
@@ -244,7 +250,8 @@ class Calibrator:
                                   "reflection_x_cm": rx, "reflection_y_cm": ry,
                                   "exclude": bool(st["exclude"]),
                                   "reflection_present": ref is not None,
-                                  "head_present": head is not None, "video": video})
+                                  "head_present": head is not None, "video": video,
+                                  "source": "model_calibration"})
         n = 0
         if rows_poly:
             labels = load_labels(Path(self.args.labels))
@@ -262,6 +269,9 @@ class Calibrator:
             out.sort_values("frame").to_csv(self.args.heads, index=False, float_format="%.4f")
             n += len(rows_head)
             print(f'Saved {len(rows_head)} head/reflection anchors to {self.args.heads}')
+        if n:
+            for st in self.caps.values():
+                st["edited"] = False
         return n
 
     def run(self) -> int:
@@ -272,25 +282,25 @@ class Calibrator:
             # X close saves too - otherwise corrections live only in memory
             # and reappear as "uncalibrated" on the next run.
             if cv2.getWindowProperty(self.title, cv2.WND_PROP_VISIBLE) < 1:
-                n = self.save()
+                self.saved_count += self.save(); n = self.saved_count
                 print("Window closed - corrections saved.")
                 break
             cv2.imshow(self.title, self.draw())
             k = cv2.waitKey(20) & 255
             if k in (27, ord("q")):
-                n = self.save(); break
+                self.saved_count += self.save(); n = self.saved_count; break
             if k == ord("s"):
-                self.save()
+                self.saved_count += self.save()
             elif k == ord("t"):
                 self.thin()
             elif k == ord("r"):
                 self.reset_poly()
             elif k == ord("e"):
-                self.state()["exclude"] = not self.state()["exclude"]
+                self.state()["exclude"] = not self.state()["exclude"]; self.state()["edited"] = True
             elif k == ord("x"):
-                self.state()["ref"] = None; self.dirty = True
+                self.state()["ref"] = None; self.dirty = True; self.state()["edited"] = True
             elif k == ord("v"):
-                self.state()["head"] = None; self.dirty = True
+                self.state()["head"] = None; self.dirty = True; self.state()["edited"] = True
             elif k in (81, ord("a")):
                 self.i = max(0, self.i - 1)
             elif k in (83, ord("d")):
@@ -319,14 +329,30 @@ def main() -> None:
         ex = pd.read_csv(a.exclude_csv)
         ex = ex.loc[ex.exclude.fillna(False).astype(bool) & (ex.video == Path(a.video).name)]
         excluded = set(int(f) for f in ex.frame)
+    # Frames saved by an earlier calibration round are never proposed again.
+    # This is separate from torso annotation: ordinary polygon labels do not
+    # count as model-calibration history.
+    history = load_heads(Path(a.heads))
+    if len(history):
+        done = history.loc[history.video == Path(a.video).name, "frame"]
+        excluded.update(int(f) for f in done.dropna())
+        if len(done):
+            print(f"Skipping {len(done)} frames already calibrated")
+    polygon_history = load_labels(Path(a.labels))
+    if "source" in polygon_history.columns:
+        done_poly = polygon_history.loc[
+            (polygon_history.video == Path(a.video).name) &
+            (polygon_history.source == "model_calibration"), "frame"]
+        excluded.update(int(f) for f in done_poly.dropna())
     pack = torch.load(a.model, map_location="cpu")
     size = int(pack["size"]); dev = "cuda" if torch.cuda.is_available() else "cpu"
-    net = UNet().to(dev); net.load_state_dict(pack["state_dict"]); net.eval()
+    in_channels = int(pack.get("in_channels", 2 if pack.get("dual_channel") else 1))
+    net = checkpoint_model(pack, dev); net.eval()
     corners = np.asarray(json.loads(Path(a.roi_json).read_text(encoding="utf-8"))["arena_corners_px"], np.float32)
     total, fps, w, h = video_properties(Path(a.video))
     k = int(a.rotate) // 90 % 4
     bg_small = None
-    if bool(pack.get("bg_subtract")):
+    if bool(pack.get("bg_subtract")) or in_channels > 1:
         bg = estimate_background(a.video)
         if bg is not None:
             bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
@@ -350,11 +376,11 @@ def main() -> None:
             frame_in = np.rot90(frame, k) if k else frame
             gray = cv2.cvtColor(frame_in, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (size, size))
-            if bg_small is not None:
-                small = bg_centered(small, bg_small)
-            x = torch.from_numpy(small[None, None].copy()).float().to(dev) / 255
+            channels = model_input(small, bg_small, in_channels, float(pack.get("bg_gain", 2.0)))
+            x = torch.from_numpy(channels[None].copy()).float().to(dev) / 255
             with torch.no_grad():
-                prob = torch.sigmoid(net(x))[0, 0].cpu().numpy()
+                output = net(x); mask_logits = output[0] if isinstance(output, tuple) else output
+                prob = torch.sigmoid(mask_logits)[0, 0].cpu().numpy()
             p_full = cv2.resize(prob, (frame_in.shape[1], frame_in.shape[0]))
             mask = p_full >= a.threshold
             frac = float(mask.mean())
@@ -366,7 +392,19 @@ def main() -> None:
     if len(valid) < 2:
         raise SystemExit("Fewer than 2 frames with a plausible mouse mask - nothing to calibrate.")
     order = valid[np.argsort(scores[valid])]
-    frames = [int(f) for f in order[: a.n_frames]]
+    # Uncertainty alone tends to return a cluster of visually identical
+    # neighbouring frames. Enforce a temporal gap, then relax it only when
+    # there are too few distinct candidates.
+    gap = max(1, total // max(1, a.n_frames * 4))
+    frames = []
+    for f in order:
+        if all(abs(int(f) - old) >= gap for old in frames):
+            frames.append(int(f))
+            if len(frames) >= a.n_frames:
+                break
+    if len(frames) < a.n_frames:
+        remaining = [int(f) for f in order if int(f) not in frames]
+        frames.extend(remaining[:a.n_frames - len(frames)])
     print(f"Selected {len(frames)} least-confident frames: {frames}")
 
     # Initial head/reflection anchors from the comparison CSV (cm -> px).
@@ -388,11 +426,11 @@ def main() -> None:
         frame_in = np.rot90(frame, k) if k else frame
         gray = cv2.cvtColor(frame_in, cv2.COLOR_BGR2GRAY)
         small = cv2.resize(gray, (size, size))
-        if bg_small is not None:
-            small = bg_centered(small, bg_small)
-        x = torch.from_numpy(small[None, None].copy()).float().to(dev) / 255
+        channels = model_input(small, bg_small, in_channels, float(pack.get("bg_gain", 2.0)))
+        x = torch.from_numpy(channels[None].copy()).float().to(dev) / 255
         with torch.no_grad():
-            prob = torch.sigmoid(net(x))[0, 0].cpu().numpy()
+            output = net(x); mask_logits = output[0] if isinstance(output, tuple) else output
+            prob = torch.sigmoid(mask_logits)[0, 0].cpu().numpy()
         mask = (cv2.resize(prob, (frame_in.shape[1], frame_in.shape[0])) >= a.threshold).astype(np.uint8) * 255
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         poly = None
@@ -404,7 +442,8 @@ def main() -> None:
                 poly = simplify(c, POLY_SIMPLIFY)
         caps[f] = {"poly": poly.copy() if poly is not None else None,
                    "head": None, "ref": None, "exclude": False,
-                   "reset": poly.copy() if poly is not None else None}
+                   "reset": poly.copy() if poly is not None else None,
+                   "edited": False}
     cap.release()
     frames = [f for f in frames if f in caps]
     cal = Calibrator(a, frames, caps, source, corners)

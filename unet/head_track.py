@@ -4,14 +4,13 @@
 For every frame:
   - the U-Net supplies a clean mouse+miniscope mask (fibre/tail excluded);
   - the body is the mask centroid (rectified arena coordinates -> cm);
-  - the head is the brightest compact spot INSIDE the dilated U-Net mask
-    (ReflectionTracker): the clean mask removes floor/fibre reflections that
-    used to fool the dark-background pipeline;
+  - new checkpoints predict a learned head heatmap inside the clean mask;
+    old checkpoints fall back to the reflection tracker;
   - excluded frames (--exclude-csv) become NaN rows and are marked in the
     overlay video.
 
 Outputs: head_track_trajectory.csv, head_track_overlay.mp4,
-head_track_metadata.json.
+mouse_miniscope_mask.mp4, head_track_metadata.json.
 """
 from __future__ import annotations
 
@@ -30,8 +29,9 @@ from compare_head_methods import ReflectionTracker  # noqa: E402
 from mouse_behavior_pipeline import (  # noqa: E402
     perspective_geometry, rectified_to_cm, robust_threshold, sample_frames, video_properties,
 )
-from model import UNet  # noqa: E402
-from preprocess import estimate_background, bg_centered  # noqa: E402
+from model import checkpoint_model  # noqa: E402
+from preprocess import estimate_background  # noqa: E402
+from postprocess import TemporalMaskFilter, model_input  # noqa: E402
 
 
 def rot_pt(p: tuple[float, float], k: int, h: int, w: int) -> tuple[float, float]:
@@ -74,6 +74,8 @@ def main() -> None:
     p.add_argument("--arena-width-cm", type=float, default=25.0)
     p.add_argument("--arena-height-cm", type=float, default=30.0)
     p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--fibre-opening", type=int, default=5)
+    p.add_argument("--reacquire-sec", type=float, default=.35)
     p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
                    help="arena turned vs training: rotate frames before the CNN "
                         "(ROI corners are rotated too; output stays in source space)")
@@ -89,8 +91,9 @@ def main() -> None:
 
     pack = torch.load(a.model, map_location="cpu")
     size = int(pack["size"])
+    in_channels = int(pack.get("in_channels", 2 if pack.get("dual_channel") else 1))
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    net = UNet().to(dev); net.load_state_dict(pack["state_dict"]); net.eval()
+    net = checkpoint_model(pack, dev); net.eval()
 
     corners = load_corners(Path(a.roi_json))
     cap = cv2.VideoCapture(a.video)
@@ -106,7 +109,7 @@ def main() -> None:
     # This is a source-space background (the CNN never sees the rectified
     # one below, which serves the reflection tracker).
     bg_small = None
-    if bool(pack.get("bg_subtract")):
+    if bool(pack.get("bg_subtract")) or in_channels > 1:
         bg = estimate_background(Path(a.video))
         if bg is not None:
             bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
@@ -145,7 +148,11 @@ def main() -> None:
     w, h = int(cap.get(3)), int(cap.get(4))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     ow = cv2.VideoWriter(str(out / "head_track_overlay.mp4"), fourcc, fps, (w, h))
+    mw = cv2.VideoWriter(str(out / "mouse_miniscope_mask.mp4"), fourcc, fps, (w, h))
     tracker = ReflectionTracker(fps)
+    temporal = TemporalMaskFilter(fps=fps, opening_px=a.fibre_opening, hold_frames=3,
+                                  reacquire_frames=max(8, round(fps * a.reacquire_sec)))
+    learned_head_ema = None
     rows = []; i = 0
     while True:
         ok, frame = cap.read()
@@ -161,13 +168,23 @@ def main() -> None:
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (size, size))
-            if bg_small is not None:
-                small = bg_centered(small, bg_small)
-            x = torch.from_numpy(small[None, None].copy()).float().to(dev) / 255
+            channels = model_input(small, bg_small, in_channels, float(pack.get("bg_gain", 2.0)))
+            x = torch.from_numpy(channels[None].copy()).float().to(dev) / 255
             with torch.no_grad():
-                prob = torch.sigmoid(net(x))[0, 0].cpu().numpy()
-            mask_src = (cv2.resize(prob, (frame.shape[1], frame.shape[0])) >= a.threshold).astype(np.uint8) * 255
-            mask_src, body_src = largest_component(mask_src)
+                output = net(x)
+                mask_logits, head_logits = output if isinstance(output, tuple) else (output, None)
+                prob = torch.sigmoid(mask_logits)[0, 0].cpu().numpy()
+                head_prob = torch.sigmoid(head_logits)[0, 0].cpu().numpy() if head_logits is not None else None
+            filtered = temporal.update(prob, a.threshold)
+            if filtered.status == "acquired":
+                learned_head_ema = None
+            if filtered.centroid is not None:
+                mask_src = cv2.resize(filtered.mask, (frame.shape[1], frame.shape[0]),
+                                      interpolation=cv2.INTER_NEAREST)
+                body_src = (filtered.centroid[0] * frame.shape[1] / size,
+                            filtered.centroid[1] * frame.shape[0] / size)
+            else:
+                mask_src = np.zeros(frame.shape[:2], np.uint8); body_src = None
             body = None; head = None; conf = 0.0
             if body_src is not None:
                 body_mask = cv2.warpPerspective(mask_src, forward, (rw, rh), flags=cv2.INTER_NEAREST)
@@ -178,9 +195,27 @@ def main() -> None:
                 if m["m00"] > 0:
                     body = (m["m10"] / m["m00"], m["m01"] / m["m00"])
                     rect = cv2.warpPerspective(frame, forward, (rw, rh))
-                    head, conf, status = tracker.update(rect, background, body, body_mask)
-                    if head is not None:
-                        head = tuple(float(v) for v in head)
+                    # New checkpoints learn a head heatmap from the existing
+                    # manual red-point labels. Restrict its maximum to a
+                    # dilated clean body mask so a highlight on the fibre
+                    # cannot become the head. Old checkpoints fall back to
+                    # the reflection tracker.
+                    if head_prob is not None:
+                        allowed = cv2.dilate(filtered.mask,
+                                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 0
+                        constrained = np.where(allowed, head_prob, 0.0)
+                        conf = float(constrained.max())
+                        if conf >= 0.20:
+                            yy, xx = np.unravel_index(int(constrained.argmax()), constrained.shape)
+                            src_head = np.asarray([[[xx * frame.shape[1] / size,
+                                                    yy * frame.shape[0] / size]]], np.float32)
+                            hp = cv2.perspectiveTransform(src_head, forward)[0, 0]
+                            learned_head_ema = hp if learned_head_ema is None else .72 * learned_head_ema + .28 * hp
+                            head = tuple(float(v) for v in learned_head_ema)
+                    if head is None:
+                        head, conf, status = tracker.update(rect, background, body, body_mask)
+                        if head is not None:
+                            head = tuple(float(v) for v in head)
                 else:
                     body = None; head = None; conf = 0.0
             overlay = frame.copy()
@@ -198,18 +233,28 @@ def main() -> None:
                     h_px = cv2.perspectiveTransform(np.asarray([[head]], np.float32), inverse)[0, 0].astype(int)
                     cv2.circle(overlay, tuple(h_px), 7, (0, 220, 255), -1, cv2.LINE_AA)
                     cv2.line(overlay, tuple(b_px), tuple(h_px), (255, 255, 255), 1, cv2.LINE_AA)
-        ow.write(np.rot90(overlay, -k) if k else overlay)
+        overlay_write = np.rot90(overlay, -k) if k else overlay
+        if mask_src is None:
+            mask_write = np.zeros((h, w), np.uint8)
+        else:
+            mask_write = np.rot90(mask_src, -k) if k else mask_src
+        ow.write(overlay_write)
+        mw.write(cv2.cvtColor(mask_write, cv2.COLOR_GRAY2BGR))
         body_cm = rectified_to_cm(body, rw, rh, a.arena_width_cm, a.arena_height_cm) if body else (float("nan"), float("nan"))
         head_cm = rectified_to_cm(head, rw, rh, a.arena_width_cm, a.arena_height_cm) if head else (float("nan"), float("nan"))
         rows.append((i, i / fps, body_cm[0], body_cm[1], head_cm[0], head_cm[1], conf))
         i += 1
-    cap.release(); ow.release()
+    cap.release(); ow.release(); mw.release()
     df = pd.DataFrame(rows, columns=["frame", "timestamp_sec", "body_x_cm", "body_y_cm",
                                      "head_x_cm", "head_y_cm", "head_confidence"])
     df.to_csv(out / "head_track_trajectory.csv", index=False, float_format="%.5f")
     (out / "head_track_metadata.json").write_text(json.dumps(
-        {"device": dev, "frames": i, "threshold": a.threshold, "rotate": a.rotate,
-         "bg_subtract": bg_small is not None,
+        {"input": str(Path(a.video).resolve()), "model": str(Path(a.model).resolve()),
+         "device": dev, "frames": i, "threshold": a.threshold, "rotate": a.rotate,
+         "bg_subtract": bg_small is not None, "in_channels": in_channels,
+         "head_source": "learned_heatmap_with_reflection_fallback" if pack.get("head_output") else "reflection",
+         "fibre_aware_temporal_filter": True,
+         "fibre_opening": a.fibre_opening, "reacquire_sec": a.reacquire_sec,
          "floor_bounds": list(floor) if floor is not None else None, "model_size": size,
          "head_valid_percent": round(100 * float(df.head_x_cm.notna().mean()), 2),
          "excluded_frames": sorted(excluded & set(range(i)))}, indent=2), encoding="utf-8")

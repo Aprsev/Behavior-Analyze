@@ -6,6 +6,55 @@ mask: `mouse + head-mounted miniscope = 1`; `fibre + tail + arena = 0`.
 This directly solves the current failure mode where a dark fibre is mistaken
 for the mouse.
 
+## Fibre-aware v2 workflow (no additional labelling required)
+
+The current training path reuses all existing torso and head labels. Do not
+repeat screening/annotation just because the model has been retrained.
+
+The v2 model fixes the tether case at three levels:
+
+- two input channels: raw grayscale keeps a stationary mouse visible, while
+  the per-video background residual provides motion contrast;
+- hard-negative mining: the highest-probability pixels outside the manual
+  mouse mask receive extra loss, so a moving black fibre is learned as a hard
+  negative instead of being drowned by millions of easy arena pixels;
+- fibre-aware temporal filtering: thin components are opened away, remaining
+  components are ranked by compactness, CNN probability and overlap with the
+  previous body. After about 0.35 s of disagreement the prior is released and
+  the tracker automatically reacquires a mouse moved by the experimenter.
+
+Existing `head_anchor_calibration.csv` points are now exported as Gaussian
+heatmaps and train an optional head decoder. At inference the learned head is
+restricted to the clean body mask; old checkpoints automatically fall back to
+the reflection tracker.
+
+Run only these steps on the GPU host after pulling the new code:
+
+```powershell
+python unet/run_unet.py prepare
+python unet/run_unet.py train
+python unet/run_unet.py infer
+python unet/run_unet.py head
+```
+
+`prepare` now synchronizes the dataset with the CSV and removes stale samples
+for each video. `train` reads only `dataset.json`, warm-starts from the current
+`best_unet.pt`, archives that checkpoint, and saves a new candidate. The
+candidate replaces the best model only when it is not worse on the exact same
+contiguous temporal validation split. Use `python unet/train.py ... --fresh`
+only when an intentional from-scratch experiment is required.
+
+The synthetic fibre regression test can be run without a GPU:
+
+```powershell
+python unet/test_postprocess.py
+```
+
+The default opening kernel is 5 pixels at 256×256 model resolution. If the
+physical tether is visibly thicker in the mask, try `--fibre-opening 7` on
+`infer`/`head`; use an odd value. `--reacquire-sec 0.35` controls how long a
+disjoint candidate is rejected before automatic relocation recovery.
+
 The existing polygon labels from `../traditional/annotate_torso_constraints.py`
 are accepted as positive masks. Draw them tightly around mouse plus miniscope,
 and explicitly exclude fibre/tail.
@@ -21,13 +70,18 @@ labels, screening and dataset export run over that list automatically.
 python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 python -m pip install -r unet/requirements-gpu.txt
 
-# 0b. GUI wizard: two tabs (training / processing), one click per step,
-#     live logs, video picker, new-video ROI auto-pick. tkinter only.
-#     Training tab: epoch / learning-rate spinboxes and a live loss curve
-#     (one point per 5 epochs). The video list survives restarts
-#     (unet/.ui_videos.json); closing an annotate/calibrate/ROI window with
-#     the X button SAVES instead of discarding the session's work.
+# 0b. Production GUI (recommended): one-click analysis, existing-label
+#     rebuild/train, and advanced annotation on separate tabs. Every video has
+#     its own ROI/output directory; paths and fibre settings survive restarts.
+#     Video decoding/training runs in child processes and never blocks Tk.
 python unet/run_unet.py ui
+
+# In the GUI, open “使用已有标注训练”. The first, prominent button is
+# “一键重建数据集并训练”; it reuses all saved CSV labels and does not start
+# another annotation round. “拼接查看已标注数据” opens a 5 x 4 contact sheet:
+# green is the training mask, red is an available head heatmap, and the arrow
+# keys change pages. Before the first rebuild it falls back to the saved
+# polygons drawn over the source videos.
 
 # 0b. NEW video, first time: click the 4 arena corners to make its ROI JSON
 #     (saved as traditional/basic_rois/{stem}_roi.json), then add the
@@ -128,14 +182,13 @@ collide between videos, and `dataset.json` accumulates one entry per video.
 
 A single recording has an almost static background, but different recordings
 may look very different (arena, lamp, camera). To stop the U-Net from
-memorizing one arena's appearance, the pipeline now centers every input on
-the video's own background before the CNN:
+memorizing one arena's appearance without making a resting mouse disappear,
+the pipeline supplies both the original image and a background residual:
 
 - `prepare_dataset.py` samples ~61 frames spread over the video and caches
   the per-pixel 85th-percentile background as `<dataset>/backgrounds/<stem>.png`;
-- `train.py` transforms each image to `x' = 128 + 2*(gray - bg)` **before**
-  the usual augmentations, i.e. the static background becomes mid-gray and
-  only deviations (mouse, miniscope, shadow) survive;
+- `train.py` builds `[gray, 128 + 2*(gray-bg)]`: the first channel preserves
+  mouse/miniscope appearance while the second highlights deviations;
 - the checkpoint records `"bg_subtract": true`;
 - `infer.py` / `head_track.py` read that flag and apply the identical
   transform at inference (estimating the background with the same function,
@@ -143,9 +196,9 @@ the video's own background before the CNN:
   keep the raw-input behaviour, so nothing breaks until you retrain.
 
 One-time migration after pulling: rerun `prepare` (⑤) once so every video
-gets its background cache, then `train` (⑥). Training only enables the
-transform when **every** video in the dataset has a cache; a mixed dataset
-falls back to raw frames with a warning.
+gets its background cache, then `train` (⑥). Training refuses a mixed dataset
+when even one video lacks a background cache, preventing train/inference input
+mismatch.
 
 ### Manual model calibration (step ⑦)
 
@@ -156,7 +209,8 @@ After training, the model's weak spots are usually a handful of hard frames.
    score is the mean `|p-0.5|` **inside the predicted mask** (background
    pixels are confidently 0 and would drown the metric otherwise);
 2. keeps only plausible masks (0.1%-20% of the frame) and picks the
-   `--n-frames` (default 20) **lowest-scoring** frames — the least confident;
+   `--n-frames` (default 20) lowest-scoring frames, with a temporal diversity
+   gap; frames already saved by an earlier calibration round are skipped;
 3. opens them in one window sorted by confidence, where you can drag the
    polygon vertices (or click an edge to insert), drag the **HEAD** dot
    (red, initialized from `head_method_comparison.csv`) and the
@@ -168,7 +222,8 @@ After training, the model's weak spots are usually a handful of hard frames.
 Corrections are upserted per (video, frame) into `manual_torso_constraints.csv`
 and `head_anchor_calibration.csv`. Exiting with corrections saved makes
 `run_unet.py calibrate` re-export the dataset and retrain automatically
-(`exit 0` = saved; nothing saved = skip retrain). The GUI shows the
+(`exit 0` = an actual edit was saved; closing without edits skips retraining).
+The GUI shows the
 annotation statistics per video (screened / labelled / remaining / excluded /
 background cache).
 
@@ -182,7 +237,7 @@ python unet/screen_frames.py --video "data/video.avi" --roi "traditional/basic_r
 python traditional/annotate_torso_constraints.py --input "data/video.avi" --comparison-csv "traditional/results/basic_recognition/video/head_method_comparison.csv" --roi-json "traditional/basic_rois/video_roi.json" --output "traditional/results/manual_torso_constraints.csv" --arena-width-cm 25 --arena-height-cm 30 --candidate-csv "traditional/results/screening.csv"
 
 # Export labels for one video into the shared dataset
-python unet/prepare_dataset.py --video "data/video.avi" --labels "traditional/results/manual_torso_constraints.csv" --output-dir "unet/datasets/project" --exclude-csv "traditional/results/screening.csv"
+python unet/prepare_dataset.py --video "data/video.avi" --labels "traditional/results/manual_torso_constraints.csv" --heads "traditional/results/head_anchor_calibration.csv" --roi-json "traditional/basic_rois/video_roi.json" --arena-width-cm 25 --arena-height-cm 30 --output-dir "unet/datasets/project" --exclude-csv "traditional/results/screening.csv"
 
 # Train
 python unet/train.py --dataset "unet/datasets/project" --output-dir "unet/models/project" --epochs 80 --batch-size 8
@@ -241,13 +296,11 @@ training videos, two layers fix it:
 
 1. runs the U-Net once to get the clean mouse+miniscope mask (fibre/tail and
    floor reflections are already suppressed by the trained model);
-2. keeps only the largest connected component, transforms it into rectified
-   arena space;
+2. removes thin fibre branches and selects the compact, temporally consistent
+   body component, then transforms it into rectified arena space;
 3. **body** = mask centroid, converted to cm;
-4. **head** = the brightest compact spot found *inside a dilated copy of the
-   mask* (the `ReflectionTracker` from `traditional/code/compare_head_methods.py`):
-   the U-Net mask restricts the search so floor/fibre highlights cannot be
-   mistaken for the miniscope, and the tracker adds EMA smoothing + confidence;
+4. **head** = the learned head heatmap restricted to a dilated clean mask;
+   checkpoints without a head decoder fall back to `ReflectionTracker`;
 5. excluded frames (from `screening.csv`) are NaN rows with an EXCLUDED border.
 
 Outputs in the inference folder:
@@ -256,6 +309,7 @@ Outputs in the inference folder:
   head_x_cm, head_y_cm, head_confidence`;
 - `head_track_overlay.mp4` — green U-Net mask, red body dot, yellow head dot,
   white body→head line;
+- `mouse_miniscope_mask.mp4` — binary clean mask from the same single pass;
 - `head_track_metadata.json` — device, head-valid percentage, excluded frames.
 
 ## Important scope
