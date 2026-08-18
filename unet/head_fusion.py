@@ -16,7 +16,7 @@ class HeadChoice:
 def choose_head(reflection, reflection_confidence: float,
                 learned, learned_confidence: float,
                 agreement_px: float = 18.0,
-                learned_threshold: float = 0.20) -> HeadChoice:
+                learned_threshold: float = 0.0) -> HeadChoice:
     """Prefer the physical reflection; learned prediction only nudges/fills.
 
     A learned point can move a valid reflection by at most 15%, and only when
@@ -36,6 +36,57 @@ def choose_head(reflection, reflection_confidence: float,
         return HeadChoice(tuple(map(float, r)), float(reflection_confidence),
                           "reflection", disagreement)
     if l is not None and np.isfinite(l).all() and learned_confidence >= learned_threshold:
+        source = ("learned_fallback" if learned_confidence >= 0.20
+                  else "learned_low_confidence_fallback")
         return HeadChoice(tuple(map(float, l)), float(learned_confidence),
-                          "learned_fallback", None)
+                          source, None)
     return HeadChoice(None, 0.0, "missing", None)
+
+
+class HeadTemporalStabilizer:
+    """Smooth uncertain head estimates in body-relative coordinates.
+
+    A tethered/miniscope mouse can translate rapidly while its head-to-body
+    vector changes much more gradually.  Reflection/manual observations reset
+    that vector immediately. Learned fallbacks update it conservatively, and
+    a truly missing candidate may reuse it only for a short bounded gap.
+    """
+
+    def __init__(self, max_gap_frames: int = 15):
+        self.relative: np.ndarray | None = None
+        self.gap = 0
+        self.max_gap_frames = max(1, int(max_gap_frames))
+
+    def update(self, body, choice: HeadChoice) -> HeadChoice:
+        if body is None:
+            self.gap += 1
+            return choice
+        b = np.asarray(body, dtype=float)
+        point = np.asarray(choice.point, dtype=float) if choice.point is not None else None
+        trusted = choice.source in {"manual_override", "reflection", "fused_reflection_primary"}
+        if point is not None and np.isfinite(point).all():
+            observed_relative = point - b
+            if trusted or self.relative is None:
+                self.relative = observed_relative
+            else:
+                # Low peaks remain useful as a direction cue, but cannot make
+                # a one-frame jump from head to tail/fibre.
+                alpha = 0.50 if choice.confidence >= 0.20 else 0.22
+                delta = observed_relative - self.relative
+                distance = float(np.linalg.norm(delta))
+                if distance > 10.0:
+                    delta *= 10.0 / distance
+                self.relative = self.relative + alpha * delta
+                point = b + self.relative
+                choice = HeadChoice(tuple(map(float, point)), choice.confidence,
+                                    "temporal_" + choice.source,
+                                    choice.disagreement_px)
+            self.gap = 0
+            return choice
+        self.gap += 1
+        if self.relative is not None and self.gap <= self.max_gap_frames:
+            predicted = b + self.relative
+            confidence = max(0.02, 0.18 * (1.0 - self.gap / (self.max_gap_frames + 1)))
+            return HeadChoice(tuple(map(float, predicted)), confidence,
+                              "temporal_short_gap", choice.disagreement_px)
+        return choice

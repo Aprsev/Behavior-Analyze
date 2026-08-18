@@ -30,7 +30,7 @@ from mouse_behavior_pipeline import (  # noqa: E402
     perspective_geometry, rectified_to_cm, robust_threshold, sample_frames, video_properties,
 )
 from model import checkpoint_model  # noqa: E402
-from head_fusion import choose_head  # noqa: E402
+from head_fusion import HeadChoice, HeadTemporalStabilizer, choose_head  # noqa: E402
 from label_compat import as_bool, video_mask  # noqa: E402
 from preprocess import estimate_background  # noqa: E402
 from postprocess import TemporalMaskFilter, model_input  # noqa: E402
@@ -155,6 +155,7 @@ def main() -> None:
     ow = cv2.VideoWriter(str(out / "head_track_overlay.mp4"), fourcc, fps, (w, h))
     mw = cv2.VideoWriter(str(out / "mouse_miniscope_mask.mp4"), fourcc, fps, (w, h))
     tracker = ReflectionTracker(fps)
+    head_temporal = HeadTemporalStabilizer(max_gap_frames=max(5, round(fps * 0.5)))
     temporal = TemporalMaskFilter(fps=fps, opening_px=a.fibre_opening, hold_frames=3,
                                   reacquire_frames=max(8, round(fps * a.reacquire_sec)))
     manual_heads = pd.DataFrame()
@@ -220,7 +221,11 @@ def main() -> None:
                                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 0
                         constrained = np.where(allowed, head_prob, 0.0)
                         learned_conf = float(constrained.max())
-                        if learned_conf >= 0.20:
+                        # Always retain the in-mask argmax as a candidate.
+                        # The heatmap loss often produces a useful location
+                        # with a peak below 0.20; confidence is preserved for
+                        # QA and temporal weighting instead of deleting it.
+                        if np.isfinite(learned_conf) and allowed.any():
                             yy, xx = np.unravel_index(int(constrained.argmax()), constrained.shape)
                             src_head = np.asarray([[[xx * frame.shape[1] / size,
                                                     yy * frame.shape[0] / size]]], np.float32)
@@ -247,8 +252,13 @@ def main() -> None:
                     if head is None:
                         choice = choose_head(reflection, reflection_conf,
                                              learned_head, learned_conf)
+                        choice = head_temporal.update(body, choice)
                         head, conf, head_source = choice.point, choice.confidence, choice.source
                         disagreement = choice.disagreement_px if choice.disagreement_px is not None else np.nan
+                    else:
+                        choice = head_temporal.update(
+                            body, HeadChoice(head, conf, head_source, None))
+                        head, conf, head_source = choice.point, choice.confidence, choice.source
                 else:
                     body = None; head = None; conf = 0.0
             overlay = frame.copy()
@@ -295,14 +305,26 @@ def main() -> None:
         {"input": str(Path(a.video).resolve()), "model": str(Path(a.model).resolve()),
          "device": dev, "frames": i, "threshold": a.threshold, "rotate": a.rotate,
          "bg_subtract": bg_small is not None, "in_channels": in_channels,
-         "head_policy": "reflection_primary_learned_fallback",
+         "head_policy": "reflection_primary_temporal_learned_fallback",
          "head_source_counts": {str(k): int(v) for k, v in df.head_source.value_counts().items()},
          "fibre_aware_temporal_filter": True,
          "fibre_opening": a.fibre_opening, "reacquire_sec": a.reacquire_sec,
          "floor_bounds": list(floor) if floor is not None else None, "model_size": size,
+         "body_valid_percent": round(100 * float(df.body_x_cm.notna().mean()), 2),
+         "reflection_valid_percent": round(100 * float(df.reflection_x_cm.notna().mean()), 2),
+         "learned_candidate_percent": round(100 * float(df.learned_head_x_cm.notna().mean()), 2),
          "head_valid_percent": round(100 * float(df.head_x_cm.notna().mean()), 2),
+         "head_reliable_percent": round(100 * float((df.head_x_cm.notna() &
+                                                       (df.head_confidence >= 0.20)).mean()), 2),
          "excluded_frames": sorted(excluded & set(range(i)))}, indent=2), encoding="utf-8")
-    print(f"Wrote {i} frames to {out}; head valid {df.head_x_cm.notna().mean():.1%}")
+    body_rate = df.body_x_cm.notna().mean()
+    reflection_rate = df.reflection_x_cm.notna().mean()
+    learned_rate = df.learned_head_x_cm.notna().mean()
+    head_rate = df.head_x_cm.notna().mean()
+    reliable_rate = (df.head_x_cm.notna() & (df.head_confidence >= 0.20)).mean()
+    print(f"Wrote {i} frames to {out}; body {body_rate:.1%}; "
+          f"reflection {reflection_rate:.1%}; learned candidate {learned_rate:.1%}; "
+          f"head valid {head_rate:.1%}; reliable {reliable_rate:.1%}")
 
 
 if __name__ == "__main__":

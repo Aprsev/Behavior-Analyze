@@ -2,7 +2,7 @@
 import unittest
 import numpy as np
 import pandas as pd
-from head_fusion import choose_head
+from head_fusion import HeadChoice, HeadTemporalStabilizer, choose_head
 from annotate_head_results import select_frames
 
 
@@ -21,6 +21,27 @@ class HeadFusionTests(unittest.TestCase):
         result = choose_head(None, 0, (20, 30), .8)
         self.assertEqual(result.source, "learned_fallback")
         self.assertEqual(result.point, (20., 30.))
+
+    def test_low_confidence_learned_point_is_not_deleted(self):
+        result = choose_head(None, 0, (20, 30), .08)
+        self.assertEqual(result.source, "learned_low_confidence_fallback")
+        self.assertEqual(result.point, (20., 30.))
+
+    def test_low_confidence_fallback_is_temporally_limited(self):
+        stabilizer = HeadTemporalStabilizer(max_gap_frames=5)
+        stabilizer.update((10, 10), HeadChoice((15, 10), .8, "reflection", None))
+        result = stabilizer.update(
+            (11, 10), HeadChoice((-20, 10), .05,
+                                 "learned_low_confidence_fallback", None))
+        self.assertEqual(result.source, "temporal_learned_low_confidence_fallback")
+        self.assertGreater(result.point[0], 10)
+
+    def test_short_missing_gap_uses_body_relative_prediction(self):
+        stabilizer = HeadTemporalStabilizer(max_gap_frames=2)
+        stabilizer.update((10, 10), HeadChoice((15, 10), .8, "reflection", None))
+        result = stabilizer.update((12, 10), HeadChoice(None, 0, "missing", None))
+        self.assertEqual(result.source, "temporal_short_gap")
+        self.assertEqual(result.point, (17., 10.))
 
     def test_annotation_selection_prioritizes_failures(self):
         rows = pd.DataFrame({"frame": [1, 2, 3], "head_x_cm": [1, 1, 8],
