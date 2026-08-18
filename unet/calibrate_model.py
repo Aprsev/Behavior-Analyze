@@ -76,7 +76,8 @@ def load_labels(path: Path) -> pd.DataFrame:
 
 def load_heads(path: Path) -> pd.DataFrame:
     cols = ["frame", "timestamp_sec", "head_x_cm", "head_y_cm", "reflection_x_cm",
-            "reflection_y_cm", "exclude", "reflection_present", "head_present", "video", "source"]
+            "reflection_y_cm", "exclude", "reflection_present", "head_present",
+            "head_verified", "reflection_verified", "video", "source"]
     if not path.is_file():
         return pd.DataFrame(columns=cols)
     df = pd.read_csv(path)
@@ -167,6 +168,7 @@ class Calibrator:
                 self.drag = ("poly", idx)
             elif kind in ("head", "ref"):
                 st[kind] = (float(x), float(y)); self.drag = (kind, -1); self.dirty = True; st["edited"] = True
+                st["head_verified" if kind == "head" else "reflection_verified"] = True
             else:
                 # click on empty space: add a polygon vertex on the nearest edge
                 poly = st["poly"]
@@ -242,7 +244,7 @@ class Calibrator:
                                   "exclude": bool(st["exclude"]), "video": video,
                                   "source": "model_calibration"})
             head = st.get("head"); ref = st.get("ref")
-            if head is not None or ref is not None:
+            if st.get("head_verified", False) or st.get("reflection_verified", False):
                 hx, hy = self.px_to_cm(head) if head is not None else (np.nan, np.nan)
                 rx, ry = self.px_to_cm(ref) if ref is not None else (np.nan, np.nan)
                 rows_head.append({"frame": frame, "timestamp_sec": frame / self.fps,
@@ -250,7 +252,10 @@ class Calibrator:
                                   "reflection_x_cm": rx, "reflection_y_cm": ry,
                                   "exclude": bool(st["exclude"]),
                                   "reflection_present": ref is not None,
-                                  "head_present": head is not None, "video": video,
+                                  "head_present": head is not None,
+                                  "head_verified": bool(st.get("head_verified", False)),
+                                  "reflection_verified": bool(st.get("reflection_verified", False)),
+                                  "video": video,
                                   "source": "model_calibration"})
         n = 0
         if rows_poly:
@@ -299,8 +304,10 @@ class Calibrator:
                 self.state()["exclude"] = not self.state()["exclude"]; self.state()["edited"] = True
             elif k == ord("x"):
                 self.state()["ref"] = None; self.dirty = True; self.state()["edited"] = True
+                self.state()["reflection_verified"] = True
             elif k == ord("v"):
                 self.state()["head"] = None; self.dirty = True; self.state()["edited"] = True
+                self.state()["head_verified"] = True
             elif k in (81, ord("a")):
                 self.i = max(0, self.i - 1)
             elif k in (83, ord("d")):
@@ -443,7 +450,8 @@ def main() -> None:
         caps[f] = {"poly": poly.copy() if poly is not None else None,
                    "head": None, "ref": None, "exclude": False,
                    "reset": poly.copy() if poly is not None else None,
-                   "edited": False}
+                   "edited": False, "head_verified": False,
+                   "reflection_verified": False}
     cap.release()
     frames = [f for f in frames if f in caps]
     cal = Calibrator(a, frames, caps, source, corners)

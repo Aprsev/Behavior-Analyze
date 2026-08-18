@@ -400,6 +400,16 @@ acts alone when Reflection is missing. After a full analysis, use
 high-disagreement frames; the accepted green mask is snapshotted alongside the
 head label so it can supervise the next training run.
 
+Automatic initial points are not training truth. New CSV rows separately store
+`head_verified` and `reflection_verified`: dragging a point verifies only that
+point, while `C` confirms the currently selected point without moving it.
+Saving a corrected Head no longer silently promotes the untouched automatic
+Reflection to a training label. During dataset rebuild, legacy Reflection rows
+without provenance are retained only when they are within 3 cm of a trusted
+anatomical Head; obvious tail-side labels are exported as empty Reflection
+targets and reported as `rejected_tail_or_unverified`. The source CSV is kept
+unchanged, so this migration is reversible.
+
 The legacy classical GUI remains available with:
 
 ```powershell

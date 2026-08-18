@@ -34,7 +34,8 @@ def select_frames(data: pd.DataFrame, existing: set[int], maximum: int) -> list[
     confidence = pd.to_numeric(confidence_col, errors="coerce").fillna(0).to_numpy()
     disagreement = pd.to_numeric(disagreement_col, errors="coerce").fillna(0).to_numpy()
     source = data.get("head_source", pd.Series("missing", index=data.index)).astype(str)
-    fallback = source.isin(["learned_fallback", "missing"]).to_numpy(float)
+    fallback = (source.str.contains("fallback", case=False, na=False) |
+                source.isin(["missing", "manual_head_absent"])).to_numpy(float)
     head = data[["head_x_cm", "head_y_cm"]].apply(pd.to_numeric, errors="coerce").to_numpy(float)
     jumps = np.r_[0.0, np.linalg.norm(np.diff(head, axis=0), axis=1)]
     jumps[~np.isfinite(jumps)] = 0
@@ -63,7 +64,14 @@ def main() -> None:
         old = pd.read_csv(a.heads)
         if "video" in old:
             old = old.loc[video_mask(old.video, Path(a.video).name)]
-        existing = set(pd.to_numeric(old.frame, errors="coerce").dropna().astype(int)) if "frame" in old else set()
+        if "frame" in old:
+            head_verified = (old["head_verified"].map(as_bool)
+                             if "head_verified" in old else pd.Series(False, index=old.index))
+            reflection_verified = (old["reflection_verified"].map(as_bool)
+                                   if "reflection_verified" in old else pd.Series(False, index=old.index))
+            fully_verified = head_verified & reflection_verified
+            existing = set(pd.to_numeric(old.loc[fully_verified, "frame"], errors="coerce")
+                           .dropna().astype(int))
     frames = select_frames(data.reset_index(drop=True), existing, a.max_labels)
     if not frames:
         print("No new low-confidence head frames remain to annotate.")
@@ -81,7 +89,8 @@ def main() -> None:
     rw, rh, forward, inverse, _, _ = perspective_geometry(
         corners, a.arena_width_cm, a.arena_height_cm)
     state = {"i": 0, "active": "head", "head": None, "reflection": None,
-             "drag": False, "exclude": False, "saved": 0}
+             "drag": False, "exclude": False, "saved": 0,
+             "head_verified": False, "reflection_verified": False}
     title = "Head result correction"
 
     def cm_to_px(point):
@@ -105,6 +114,8 @@ def main() -> None:
         state["head"] = point("head")
         state["reflection"] = point("reflection")
         state["exclude"] = False
+        state["head_verified"] = False
+        state["reflection_verified"] = False
 
     def frame_image():
         frame = frames[state["i"]]
@@ -123,14 +134,16 @@ def main() -> None:
         cv2.rectangle(image, (0, 0), (image.shape[1], 58), (0, 0, 0), -1)
         cv2.putText(image, f"{state['i']+1}/{len(frames)} frame={frame} source={row.get('head_source','?')} active={state['active'].upper()}",
                     (8, 21), cv2.FONT_HERSHEY_SIMPLEX, .48, (255, 255, 255), 1)
-        cv2.putText(image, "H/R select  drag point  X reflection absent  N head absent  E exclude  A/D  S save+next  Q save+quit",
+        cv2.putText(image, "H/R select  drag=verify  C confirm point  X reflection absent  N head absent  E exclude  A/D  S save+next  Q quit",
                     (8, 45), cv2.FONT_HERSHEY_SIMPLEX, .37, (255, 255, 255), 1)
         return image
 
     def save():
         frame = frames[state["i"]]
         atomic_upsert_head(a.heads, a.video, frame, frame / fps,
-                           state["head"], state["reflection"], state["exclude"])
+                           state["head"], state["reflection"], state["exclude"],
+                           head_verified=state["head_verified"],
+                           reflection_verified=state["reflection_verified"])
         # The green mask has already been accepted as accurate. Snapshot it as
         # this frame's torso label so every newly corrected head point is
         # actually exportable as a supervised heatmap during the next rebuild.
@@ -150,6 +163,7 @@ def main() -> None:
     def mouse(event, x, y, _flags, _param):
         if event == cv2.EVENT_LBUTTONDOWN:
             state["drag"] = True; state[state["active"]] = px_to_cm((x, y))
+            state[state["active"] + "_verified"] = True
         elif event == cv2.EVENT_MOUSEMOVE and state["drag"]:
             state[state["active"]] = px_to_cm((x, y))
         elif event == cv2.EVENT_LBUTTONUP:
@@ -164,8 +178,11 @@ def main() -> None:
             save(); break
         if key == ord("h"): state["active"] = "head"
         elif key == ord("r"): state["active"] = "reflection"
-        elif key == ord("x"): state["reflection"] = None
-        elif key == ord("n"): state["head"] = None
+        elif key == ord("c"): state[state["active"] + "_verified"] = True
+        elif key == ord("x"):
+            state["reflection"] = None; state["reflection_verified"] = True
+        elif key == ord("n"):
+            state["head"] = None; state["head_verified"] = True
         elif key == ord("e"): state["exclude"] = not state["exclude"]
         elif key == ord("s"):
             save()

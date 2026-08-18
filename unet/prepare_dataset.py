@@ -44,6 +44,8 @@ def main():
     p.add_argument('--roi-json', default='', help='ROI needed to convert head cm coordinates to source pixels')
     p.add_argument('--arena-width-cm', type=float, default=25.0)
     p.add_argument('--arena-height-cm', type=float, default=30.0)
+    p.add_argument('--max-head-reflection-cm', type=float, default=3.0,
+                   help='legacy unverified reflections farther from Head are rejected')
     p.add_argument('--output-dir', required=True); p.add_argument('--size', type=int, default=256)
     p.add_argument('--exclude-csv', default=''); a = p.parse_args()
     labels = pd.read_csv(a.labels)
@@ -82,6 +84,33 @@ def main():
             heads = heads.loc[~heads.exclude.map(as_bool)]
         if len(heads):
             heads = heads.drop_duplicates('frame', keep='last').set_index('frame')
+            head_xy = heads.reindex(columns=['head_x_cm', 'head_y_cm']).apply(
+                pd.to_numeric, errors='coerce').to_numpy(float)
+            reflection_xy = heads.reindex(columns=['reflection_x_cm', 'reflection_y_cm']).apply(
+                pd.to_numeric, errors='coerce').to_numpy(float)
+            head_present = (heads['head_present'].map(as_bool).to_numpy()
+                            if 'head_present' in heads else np.isfinite(head_xy).all(axis=1))
+            if 'head_verified' in heads:
+                head_verified_raw = heads['head_verified']
+                head_trusted = head_verified_raw.isna().to_numpy() | head_verified_raw.map(as_bool).to_numpy()
+            else:
+                head_trusted = np.ones(len(heads), dtype=bool)  # legacy manual rows
+            heads['_head_usable'] = head_present & head_trusted
+            both = (heads['_head_usable'].to_numpy(bool) &
+                    np.isfinite(head_xy).all(axis=1) & np.isfinite(reflection_xy).all(axis=1))
+            distance = np.full(len(heads), np.inf, dtype=float)
+            distance[both] = np.linalg.norm(head_xy[both] - reflection_xy[both], axis=1)
+            verified = (heads['reflection_verified'].map(as_bool).to_numpy()
+                        if 'reflection_verified' in heads else np.zeros(len(heads), dtype=bool))
+            reflection_present = (heads['reflection_present'].map(as_bool).to_numpy()
+                                  if 'reflection_present' in heads else
+                                  np.isfinite(reflection_xy).all(axis=1))
+            heads['_reflection_usable'] = reflection_present & (
+                verified | (both & (distance <= a.max_head_reflection_cm)))
+            reflection_rejected = int((reflection_present & ~heads['_reflection_usable'].to_numpy(bool)).sum())
+            print(f'Reflection label audit: accepted={int(heads["_reflection_usable"].sum())}, '
+                  f'rejected_tail_or_unverified={reflection_rejected}, '
+                  f'max_head_distance_cm={a.max_head_reflection_cm:.1f}')
     inverse = None; rect_w = rect_h = None
     if a.roi_json and Path(a.roi_json).is_file():
         roi = json.loads(Path(a.roi_json).read_text(encoding='utf-8'))
@@ -119,6 +148,10 @@ def main():
                 x_cm = pd.to_numeric(hr.get(f'{prefix}_x_cm'), errors='coerce')
                 y_cm = pd.to_numeric(hr.get(f'{prefix}_y_cm'), errors='coerce')
                 present = as_bool(hr.get(present_column, True))
+                if prefix == 'head' and not as_bool(hr.get('_head_usable', False)):
+                    present = False
+                if prefix == 'reflection' and not as_bool(hr.get('_reflection_usable', False)):
+                    present = False
                 if not present or not np.isfinite([x_cm, y_cm]).all():
                     return np.zeros((a.size, a.size), np.uint8)
                 rect_pt = np.asarray([[[float(x_cm) / a.arena_width_cm * (rect_w - 1),

@@ -53,10 +53,13 @@ class LabelCompatibilityTests(unittest.TestCase):
     def test_atomic_head_pair_update(self):
         folder = Path(tempfile.mkdtemp()); labels = folder / "heads.csv"
         atomic_upsert_head(labels, "video.avi", 12, .4, (4.2, 5.3), (4.0, 5.0))
-        atomic_upsert_head(labels, "video.avi", 12, .4, (4.4, 5.5), (4.1, 5.1))
+        atomic_upsert_head(labels, "video.avi", 12, .4, (4.4, 5.5), (4.1, 5.1),
+                           head_verified=True, reflection_verified=True)
         result = pd.read_csv(labels)
         self.assertEqual(len(result), 1)
         self.assertAlmostEqual(result.head_x_cm.iloc[0], 4.4)
+        self.assertTrue(bool(result.head_verified.iloc[0]))
+        self.assertTrue(bool(result.reflection_verified.iloc[0]))
         self.assertTrue(labels.with_suffix(".csv.bak").is_file())
 
 

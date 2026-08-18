@@ -16,7 +16,7 @@ reflection anchor. The active target can be changed with H/R.
 
 Keyboard controls
 -----------------
-H: edit head (red)       R: edit reflection (magenta)
+H: edit head (red)       R: edit reflection (magenta)   C: confirm active point
 E: toggle exclusion      X: mark reflection absent
 N: mark head absent      A/D or left/right: previous/next candidate frame
 J/L: -10/+10 frames      S: save now                 Q/Esc: save and quit
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_existing(path: Path) -> pd.DataFrame:
-    columns = ["frame", "timestamp_sec", "head_x_cm", "head_y_cm", "reflection_x_cm", "reflection_y_cm", "exclude", "reflection_present", "head_present"]
+    columns = ["frame", "timestamp_sec", "head_x_cm", "head_y_cm", "reflection_x_cm", "reflection_y_cm", "exclude", "reflection_present", "head_present", "head_verified", "reflection_verified"]
     if not path.exists():
         return pd.DataFrame(columns=columns)
     data = pd.read_csv(path)
@@ -128,7 +128,7 @@ class Annotator:
             # explicitly before checking for missing automatic candidates.
             head_values = pd.to_numeric(base.loc[list(HEAD_COLUMNS)], errors="coerce").to_numpy(dtype=float)
             reflection_values = pd.to_numeric(base.loc[list(REFLECTION_COLUMNS)], errors="coerce").to_numpy(dtype=float)
-            row = {"frame": frame, "timestamp_sec": float(base.timestamp_sec), "head_x_cm": head_values[0], "head_y_cm": head_values[1], "reflection_x_cm": reflection_values[0], "reflection_y_cm": reflection_values[1], "exclude": False, "reflection_present":bool(np.isfinite(reflection_values).all()), "head_present": bool(np.isfinite(head_values).all())}
+            row = {"frame": frame, "timestamp_sec": float(base.timestamp_sec), "head_x_cm": head_values[0], "head_y_cm": head_values[1], "reflection_x_cm": reflection_values[0], "reflection_y_cm": reflection_values[1], "exclude": False, "reflection_present":bool(np.isfinite(reflection_values).all()), "head_present": bool(np.isfinite(head_values).all()), "head_verified": False, "reflection_verified": False}
             self.labels.loc[frame] = row
         return self.labels.loc[frame]
 
@@ -136,9 +136,9 @@ class Annotator:
         row = self.current()
         x_cm, y_cm = self.px_to_cm((x, y))
         if self.active == "head":
-            self.labels.loc[row.frame, ["head_x_cm", "head_y_cm", "head_present"]] = [x_cm, y_cm, True]
+            self.labels.loc[row.frame, ["head_x_cm", "head_y_cm", "head_present", "head_verified"]] = [x_cm, y_cm, True, True]
         else:
-            self.labels.loc[row.frame, ["reflection_x_cm", "reflection_y_cm", "reflection_present"]] = [x_cm, y_cm, True]
+            self.labels.loc[row.frame, ["reflection_x_cm", "reflection_y_cm", "reflection_present", "reflection_verified"]] = [x_cm, y_cm, True, True]
 
     def mouse(self, event, x, y, flags, param) -> None:
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -171,6 +171,8 @@ class Annotator:
         result["exclude"] = result.exclude.fillna(False).astype(bool)
         result["reflection_present"] = result.reflection_present.fillna(False).astype(bool)
         result["head_present"] = result.head_present.fillna(False).astype(bool)
+        result["head_verified"] = result.head_verified.fillna(False).astype(bool)
+        result["reflection_verified"] = result.reflection_verified.fillna(False).astype(bool)
         result.to_csv(self.args.output, index=False, float_format="%.6f")
         print(f"Saved {len(result)} labelled frames to {self.args.output}")
 
@@ -183,12 +185,14 @@ class Annotator:
                 self.save(); break
             if key == ord("h"): self.active = "head"
             elif key == ord("r"): self.active = "reflection"
+            elif key == ord("c"):
+                row = self.current(); self.labels.loc[row.frame, self.active + "_verified"] = True
             elif key == ord("e"):
                 row = self.current(); self.labels.loc[row.frame, "exclude"] = not bool(row.exclude)
             elif key == ord("x"):
-                row = self.current(); self.labels.loc[row.frame, ["reflection_present", "reflection_x_cm", "reflection_y_cm"]] = [False, np.nan, np.nan]
+                row = self.current(); self.labels.loc[row.frame, ["reflection_present", "reflection_x_cm", "reflection_y_cm", "reflection_verified"]] = [False, np.nan, np.nan, True]
             elif key == ord("n"):
-                row = self.current(); self.labels.loc[row.frame, ["head_present", "head_x_cm", "head_y_cm"]] = [False, np.nan, np.nan]
+                row = self.current(); self.labels.loc[row.frame, ["head_present", "head_x_cm", "head_y_cm", "head_verified"]] = [False, np.nan, np.nan, True]
             elif key == ord("s"): self.save()
             elif key in (81, ord("a")): self.index = max(0, self.index - 1)
             elif key in (83, ord("d")): self.index = min(len(self.frames) - 1, self.index + 1)

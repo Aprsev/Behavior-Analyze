@@ -97,12 +97,15 @@ def atomic_upsert_polygon(path: str | Path, video: str | Path, frame: int,
 def atomic_upsert_head(path: str | Path, video: str | Path, frame: int,
                        timestamp_sec: float, head, reflection,
                        exclude: bool = False,
-                       source: str = "head_result_correction") -> Path:
+                       source: str = "head_result_correction",
+                       head_verified: bool = False,
+                       reflection_verified: bool = False) -> Path:
     """Atomically upsert one manual head/reflection pair across many videos."""
     path = Path(path)
     columns = ["frame", "timestamp_sec", "head_x_cm", "head_y_cm",
                "reflection_x_cm", "reflection_y_cm", "exclude",
-               "reflection_present", "head_present", "video", "source"]
+               "reflection_present", "head_present", "head_verified",
+               "reflection_verified", "video", "source"]
     try:
         old = pd.read_csv(path) if path.is_file() else pd.DataFrame(columns=columns)
     except pd.errors.EmptyDataError:
@@ -119,7 +122,10 @@ def atomic_upsert_head(path: str | Path, video: str | Path, frame: int,
                      "head_x_cm": h[0], "head_y_cm": h[1],
                      "reflection_x_cm": r[0], "reflection_y_cm": r[1],
                      "exclude": bool(exclude), "reflection_present": bool(np.isfinite(r).all()),
-                     "head_present": bool(np.isfinite(h).all()), "video": Path(video).name,
+                     "head_present": bool(np.isfinite(h).all()),
+                     "head_verified": bool(head_verified),
+                     "reflection_verified": bool(reflection_verified),
+                     "video": Path(video).name,
                      "source": source})
     merged = pd.concat([old.loc[~matches], pd.DataFrame([previous])], ignore_index=True)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import run_unet as R
-from label_compat import video_matches
+from label_compat import as_bool, video_matches
 
 FONT = ("Microsoft YaHei UI", 10)
 SMALL = ("Microsoft YaHei UI", 9)
@@ -352,10 +352,14 @@ class App:
                 lambda value: str(value).strip().casefold() in {"1", "true", "yes", "y"}).sum())
             reflection_present = int(head_rows.get("reflection_present", pd.Series(True, index=head_rows.index)).map(
                 lambda value: str(value).strip().casefold() in {"1", "true", "yes", "y"}).sum())
+            head_verified = int(head_rows.get("head_verified", pd.Series(False, index=head_rows.index)).map(as_bool).sum())
+            reflection_verified = int(head_rows.get(
+                "reflection_verified", pd.Series(False, index=head_rows.index)).map(as_bool).sum())
             torso_excluded = int(torso_rows.exclude.map(lambda value: str(value).strip().casefold() in
                                  {"1", "true", "yes", "y", "excluded"}).sum()) if "exclude" in torso_rows else 0
             lines.append(f"{name}\n  torso: {len(torso_rows)}（排除 {torso_excluded}）"
-                         f"    Head: {head_present}    Reflection: {reflection_present}")
+                         f"    Head: {head_present}（确认 {head_verified}）"
+                         f"    Reflection: {reflection_present}（确认 {reflection_verified}）")
         messagebox.showinfo("现有标注统计", "\n\n".join(lines) if lines else "没有标注记录")
 
     def view_annotations(self, source: str = "all") -> None:
