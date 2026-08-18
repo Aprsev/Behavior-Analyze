@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import json
+from pathlib import Path
+import tempfile
 import unittest
 
-from label_compat import as_bool, normalize_polygon, video_matches
+import pandas as pd
+
+from label_compat import as_bool, atomic_upsert_polygon, normalize_polygon, video_matches
 
 
 class LabelCompatibilityTests(unittest.TestCase):
@@ -26,6 +30,24 @@ class LabelCompatibilityTests(unittest.TestCase):
         self.assertFalse(as_bool("0"))
         self.assertTrue(as_bool("True"))
         self.assertTrue(as_bool(1))
+
+    def test_atomic_old_format_update_preserves_other_rows(self):
+        folder = Path(tempfile.mkdtemp())
+        labels = folder / "labels.csv"
+        pd.DataFrame([
+            {"video": r"D:\old\video.avi", "frame": 1,
+             "polygon_px": json.dumps([[[1, 2]], [[3, 4]], [[5, 6]]]), "exclude": False},
+            {"video": "other.avi", "frame": 2,
+             "polygon_px": json.dumps([[7, 8], [9, 10], [11, 12]]), "exclude": False},
+        ]).to_csv(labels, index=False)
+        backup = atomic_upsert_polygon(labels, "video.avi", 1,
+                                       [[10, 20], [30, 40], [50, 60]], False)
+        result = pd.read_csv(labels)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(backup.is_file())
+        row = result.loc[result.video == "video.avi"].iloc[0]
+        self.assertEqual(normalize_polygon(row.polygon_px).tolist(),
+                         [[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
 
 
 if __name__ == "__main__":

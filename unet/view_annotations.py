@@ -11,6 +11,9 @@ import argparse
 import math
 import json
 import re
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import cv2
@@ -32,8 +35,12 @@ class ContactSheet:
         self.dataset = Path(args.dataset)
         self.items = self._load_items()
         self.page = 0
+        self.editing = False
         self.photos: list[ImageTk.PhotoImage] = []
         self.page_var = tk.StringVar()
+        self.mode_var = tk.StringVar(value=self.mode)
+        self.details_var = tk.StringVar(value=getattr(self, "csv_stats", f"共 {len(self.items)} 张"))
+        self.edit_status_var = tk.StringVar(value="双击任意缩略图：放大编辑；拖动结束即自动保存到 CSV")
         self._build()
         self.root.after(10, self.render)
 
@@ -42,23 +49,33 @@ class ContactSheet:
         if not images.is_dir():
             return []
         names: list[str] = []
+        records: dict[str, dict] = {}
         manifest = self.dataset / "dataset.json"
         if manifest.is_file():
             try:
                 data = json.loads(manifest.read_text(encoding="utf-8"))
-                for video in data.get("videos", []):
-                    names.extend(str(name) for name in video.get("samples", []))
+                for record in data.get("videos", []):
+                    for name in record.get("samples", []):
+                        names.append(str(name)); records[str(name)] = record
             except (OSError, json.JSONDecodeError, TypeError):
                 names = []
         if not names:
             names = [path.name for path in sorted(images.glob("*.png"))]
         items = []
+        configured = [Path(path) for path in self.args.video if Path(path).is_file()]
         for name in dict.fromkeys(names):
             if not (images / name).is_file() or not (self.dataset / "masks" / name).is_file():
                 continue
             match = re.match(r"(.+)_([0-9]{7})\.png$", name)
             key = (match.group(1), int(match.group(2))) if match else (name, -1)
-            items.append({"kind": "dataset", "name": name, "key": key})
+            record = records.get(name, {})
+            recorded = Path(record.get("video", ""))
+            video = recorded if recorded.is_file() else next(
+                (path for path in configured
+                 if video_matches(record.get("video", key[0]), path) or video_matches(key[0], path)), None)
+            items.append({"kind": "dataset", "name": name, "key": key,
+                          "video": video, "frame": key[1],
+                          "initial_mask": self.dataset / "masks" / name})
         return items
 
     def _raw_items(self) -> list[dict]:
@@ -139,12 +156,13 @@ class ContactSheet:
         self.root.minsize(980, 650)
         toolbar = ttk.Frame(self.root)
         toolbar.pack(fill="x", padx=10, pady=8)
-        ttk.Label(toolbar, text=self.mode, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
-        details = getattr(self, "csv_stats", f"共 {len(self.items)} 张")
-        ttk.Label(toolbar, text=details, foreground="#555").pack(side="left", padx=12)
+        ttk.Label(toolbar, textvariable=self.mode_var, font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
+        ttk.Label(toolbar, textvariable=self.details_var, foreground="#555").pack(side="left", padx=12)
         ttk.Button(toolbar, text="上一页  ←", command=lambda: self.move(-1)).pack(side="right", padx=4)
         ttk.Button(toolbar, text="下一页  →", command=lambda: self.move(1)).pack(side="right", padx=4)
         ttk.Label(toolbar, textvariable=self.page_var).pack(side="right", padx=12)
+        ttk.Label(self.root, textvariable=self.edit_status_var,
+                  foreground="#176b3a", font=("Microsoft YaHei UI", 9)).pack(anchor="w", padx=12)
         self.grid = ttk.Frame(self.root)
         self.grid.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         for column in range(self.COLS):
@@ -215,11 +233,15 @@ class ContactSheet:
                 pil.thumbnail(self.THUMBNAIL, Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(pil)
                 self.photos.append(photo)
-                ttk.Label(cell, image=photo).pack(expand=True, padx=2, pady=(2, 0))
+                image_label = ttk.Label(cell, image=photo, cursor="hand2")
+                image_label.pack(expand=True, padx=2, pady=(2, 0))
                 title = item["name"]
                 if len(title) > 38:
                     title = title[:17] + "…" + title[-18:]
-                ttk.Label(cell, text=title, font=("Microsoft YaHei UI", 8)).pack(pady=(0, 2))
+                title_label = ttk.Label(cell, text=title, font=("Microsoft YaHei UI", 8), cursor="hand2")
+                title_label.pack(pady=(0, 2))
+                for widget in (cell, image_label, title_label):
+                    widget.bind("<Double-Button-1>", lambda _event, selected=item: self.edit_item(selected))
         finally:
             for cap in captures.values():
                 cap.release()
@@ -230,6 +252,44 @@ class ContactSheet:
         if new_page != self.page:
             self.page = new_page
             self.render()
+
+    def edit_item(self, item: dict) -> None:
+        if self.editing:
+            messagebox.showinfo("编辑器已打开", "请先关闭当前大图编辑器。")
+            return
+        if self.args.source == "dataset":
+            messagebox.showinfo("只读训练样本", "请从“拼接查看全部已有标注”进入修改；此处用于审计上次重建结果。")
+            return
+        video = item.get("video")
+        if video is None or not Path(video).is_file():
+            messagebox.showerror("找不到源视频", "该历史样本的原视频路径在本主机不可用。\n请先把对应视频添加到主界面的视频列表。")
+            return
+        command = [sys.executable, str(Path(__file__).with_name("edit_polygon_label.py")),
+                   "--video", str(video), "--frame", str(item["frame"]),
+                   "--labels", str(self.args.labels)]
+        initial_mask = item.get("initial_mask")
+        if initial_mask and Path(initial_mask).is_file():
+            command.extend(["--initial-mask", str(initial_mask)])
+        self.editing = True
+
+        def worker():
+            try:
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.root.after(0, lambda: self._edit_finished(result.returncode, result.stdout, result.stderr))
+            except OSError as exc:
+                self.root.after(0, lambda error=str(exc): self._edit_finished(-1, "", error))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _edit_finished(self, returncode: int, stdout: str, stderr: str) -> None:
+        self.editing = False
+        if returncode:
+            messagebox.showerror("标注编辑失败", stderr.strip() or stdout.strip() or f"exit {returncode}")
+            return
+        self.items = self._load_items()
+        self.mode_var.set(self.mode)
+        self.details_var.set(getattr(self, "csv_stats", f"共 {len(self.items)} 张"))
+        self.edit_status_var.set("已实时保存 CSV 并刷新；训练数据请点击主界面的“仅重建数据集”同步")
+        self.render()
 
 
 def main() -> None:

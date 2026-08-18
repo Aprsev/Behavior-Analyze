@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -54,3 +55,40 @@ def normalize_polygon(value) -> np.ndarray:
     if len(polygon) < 3 or not np.isfinite(polygon).all():
         raise ValueError("polygon contains too few or non-finite points")
     return polygon
+
+
+def atomic_upsert_polygon(path: str | Path, video: str | Path, frame: int,
+                          polygon, exclude: bool = False,
+                          source: str = "contact_sheet_edit") -> Path:
+    """Upsert one polygon, verify the CSV, and preserve the previous file."""
+    path = Path(path)
+    columns = ["frame", "polygon_px", "exclude", "video", "source"]
+    try:
+        old = pd.read_csv(path) if path.is_file() else pd.DataFrame(columns=columns)
+    except pd.errors.EmptyDataError:
+        old = pd.DataFrame(columns=columns)
+    if "video" not in old:
+        old["video"] = Path(video).name
+    if "frame" not in old:
+        old["frame"] = np.nan
+    matches = video_mask(old["video"], video) & (pd.to_numeric(old["frame"], errors="coerce") == int(frame))
+    previous = old.loc[matches].iloc[-1].to_dict() if matches.any() else {}
+    previous.update({"frame": int(frame),
+                     "polygon_px": json.dumps(normalize_polygon(polygon).round(1).tolist()),
+                     "exclude": bool(exclude), "video": Path(video).name,
+                     "source": source})
+    merged = pd.concat([old.loc[~matches], pd.DataFrame([previous])], ignore_index=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    backup = path.with_suffix(path.suffix + ".bak")
+    merged.to_csv(temporary, index=False)
+    check = pd.read_csv(temporary)
+    saved = video_mask(check["video"], video) & (pd.to_numeric(check["frame"], errors="coerce") == int(frame))
+    if saved.sum() != 1:
+        temporary.unlink(missing_ok=True)
+        raise IOError(f"save verification failed for {Path(video).name} frame {frame}")
+    normalize_polygon(check.loc[saved, "polygon_px"].iloc[0])
+    if path.is_file():
+        shutil.copy2(path, backup)
+    temporary.replace(path)
+    return backup

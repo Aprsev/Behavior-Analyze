@@ -85,6 +85,9 @@ python unet/run_unet.py ui
 # and available head heatmap (red). Arrow keys change pages.
 # “复查/修正已有轮廓” automatically re-exports the current video after the
 # correction window closes, including removal of newly excluded stale PNGs.
+# In the contact sheet, double-click a tile for a large single-frame editor.
+# Drag points, click an edge to add, right-click to delete, E to exclude, and
+# S to save+close. Completed edits auto-save to CSV and refresh the page.
 
 # 0b. NEW video, first time: click the 4 arena corners to make its ROI JSON
 #     (saved as traditional/basic_rois/{stem}_roi.json), then add the

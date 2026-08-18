@@ -375,6 +375,9 @@ legacy path/polygon formats; **查看上次重建样本** separately checks the 
 **复查/修正已有轮廓** on the advanced tab to overwrite an incorrect old label.
 Closing that review window automatically rebuilds the current video's dataset,
 so newly excluded frames and corrected masks cannot remain as stale PNGs.
+In the contact sheet, double-click a thumbnail to open a large editor. Drag a
+point or click an edge to add one; every completed edit is atomically saved to
+the CSV and the contact-sheet page refreshes when the editor closes.
 
 The legacy classical GUI remains available with:
 
