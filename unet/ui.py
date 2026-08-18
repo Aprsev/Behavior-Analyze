@@ -317,6 +317,12 @@ class App:
             # training dataset so stale PNG masks cannot survive a review.
             commands = [R.annotate_cmd(cfg, w, h, self.args, review_existing=True),
                         R.prepare_cmd(cfg, w, h, self.args)]
+        elif key == "head_result":
+            trajectory = self.output_path() / "head_track_trajectory.csv"
+            if not trajectory.is_file():
+                messagebox.showerror("缺少头部结果", "请先在“一键分析”页面运行完整分析。"); return
+            commands = [R.annotate_head_results_cmd(self.make_v(), cfg, self.args),
+                        R.prepare_cmd(cfg, w, h, self.args)]
         elif key == "calibrate":
             if not self.args.model.is_file():
                 messagebox.showerror("缺少模型", "请先训练模型。"); return
@@ -671,9 +677,11 @@ class App:
         self._button(advanced, "生成传统对比数据", lambda: self.advanced_step("compare")).pack(side="left", padx=3)
         self._button(advanced, "筛选新帧", lambda: self.advanced_step("screen")).pack(side="left", padx=3)
         self._button(advanced, "补充多边形标注", lambda: self.advanced_step("annotate")).pack(side="left", padx=3)
-        self._button(advanced, "复查/修正已有轮廓", lambda: self.advanced_step("review")).pack(side="left", padx=3)
-        self._button(advanced, "校准并重训", lambda: self.advanced_step("calibrate")).pack(side="left", padx=3)
-        self._button(advanced, "查看标注统计", self.show_annotation_stats).pack(side="left", padx=3)
+        corrections = ttk.Frame(annotation_tab); corrections.pack(fill="x", padx=8, pady=(0, 6))
+        self._button(corrections, "复查/修正已有轮廓", lambda: self.advanced_step("review")).pack(side="left", padx=3)
+        self._button(corrections, "根据结果补充 Head 标记", lambda: self.advanced_step("head_result")).pack(side="left", padx=3)
+        self._button(corrections, "校准并重训", lambda: self.advanced_step("calibrate")).pack(side="left", padx=3)
+        self._button(corrections, "查看标注统计", self.show_annotation_stats).pack(side="left", padx=3)
         ttk.Label(annotation_tab, text="每视频最多新增帧数", font=FONT).pack(anchor="w", padx=12, pady=(10, 2))
         ttk.Spinbox(annotation_tab, from_=1, to=100, textvariable=self.per_video_var, width=6).pack(anchor="w", padx=12)
 

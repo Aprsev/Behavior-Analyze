@@ -379,6 +379,13 @@ In the contact sheet, double-click a thumbnail to open a large editor. Drag a
 point or click an edge to add one; every completed edit is atomically saved to
 the CSV and the contact-sheet page refreshes when the editor closes.
 
+Head tracking is reflection-first: the physical reflection is used whenever
+available, the learned heatmap may only make a small agreeing correction, and
+acts alone only when reflection is missing. After a full analysis, use
+**根据结果补充 Head 标记** to correct automatically selected low-confidence or
+high-disagreement frames; the accepted green mask is snapshotted alongside the
+head label so it can supervise the next training run.
+
 The legacy classical GUI remains available with:
 
 ```powershell

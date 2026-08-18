@@ -190,7 +190,19 @@ def head_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
         "--arena-width-cm", f"{a.arena_width_cm:.2f}", "--arena-height-cm", f"{a.arena_height_cm:.2f}",
         "--threshold", f"{a.threshold:.2f}", "--rotate", str(a.rotate),
         "--fibre-opening", str(a.fibre_opening), "--reacquire-sec", f"{a.reacquire_sec:.2f}",
-        "--exclude-csv", str(a.screening)]
+        "--exclude-csv", str(a.screening), "--head-labels", str(v["heads"])]
+
+
+def annotate_head_results_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
+    return UNET / "annotate_head_results.py", [
+        "--video", str(cfg["video"]),
+        "--trajectory", str(v["infer_out"] / "head_track_trajectory.csv"),
+        "--roi-json", str(cfg["roi"]), "--heads", str(v["heads"]),
+        "--mask-video", str(v["infer_out"] / "mouse_miniscope_mask.mp4"),
+        "--torso-labels", str(v["labels"]),
+        "--arena-width-cm", f"{a.arena_width_cm:.2f}",
+        "--arena-height-cm", f"{a.arena_height_cm:.2f}",
+        "--max-labels", str(a.max_labels), "--rotate", str(a.rotate)]
 
 
 def roi_cmd(v: dict) -> tuple[Path, list[str]]:

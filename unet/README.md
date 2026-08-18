@@ -18,6 +18,10 @@ The v2 model fixes the tether case at three levels:
 - hard-negative mining: the highest-probability pixels outside the manual
   mouse mask receive extra loss, so a moving black fibre is learned as a hard
   negative instead of being drowned by millions of easy arena pixels;
+- reflection-first head fusion: a valid physical reflection cannot be
+  replaced by a confidently wrong heatmap. An agreeing heatmap contributes at
+  most 15%; when reflection is missing it becomes the fallback. Per-frame
+  `head_source` and both candidate coordinates are exported for auditing;
 - fibre-aware temporal filtering: thin components are opened away, remaining
   components are ranked by compactness, CNN probability and overlap with the
   previous body. After about 0.35 s of disagreement the prior is released and

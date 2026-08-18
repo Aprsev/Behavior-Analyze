@@ -30,6 +30,8 @@ from mouse_behavior_pipeline import (  # noqa: E402
     perspective_geometry, rectified_to_cm, robust_threshold, sample_frames, video_properties,
 )
 from model import checkpoint_model  # noqa: E402
+from head_fusion import choose_head  # noqa: E402
+from label_compat import as_bool, video_mask  # noqa: E402
 from preprocess import estimate_background  # noqa: E402
 from postprocess import TemporalMaskFilter, model_input  # noqa: E402
 
@@ -80,12 +82,15 @@ def main() -> None:
                    help="arena turned vs training: rotate frames before the CNN "
                         "(ROI corners are rotated too; output stays in source space)")
     p.add_argument("--exclude-csv", default="")
+    p.add_argument("--head-labels", default="",
+                   help="manual head/reflection CSV; exact frames override and reseed tracking")
     a = p.parse_args()
 
     excluded: set[int] = set()
     if a.exclude_csv and Path(a.exclude_csv).is_file():
         ex = pd.read_csv(a.exclude_csv)
-        ex = ex.loc[ex.exclude.fillna(False).astype(bool) & (ex.video == Path(a.video).name)]
+        matches = video_mask(ex.video, Path(a.video).name) if "video" in ex else pd.Series(True, index=ex.index)
+        ex = ex.loc[ex.exclude.map(as_bool) & matches]
         excluded = set(int(f) for f in ex.frame)
         print(f"Marking {len(excluded)} screened frames as excluded")
 
@@ -152,7 +157,15 @@ def main() -> None:
     tracker = ReflectionTracker(fps)
     temporal = TemporalMaskFilter(fps=fps, opening_px=a.fibre_opening, hold_frames=3,
                                   reacquire_frames=max(8, round(fps * a.reacquire_sec)))
-    learned_head_ema = None
+    manual_heads = pd.DataFrame()
+    if a.head_labels and Path(a.head_labels).is_file():
+        manual_heads = pd.read_csv(a.head_labels)
+        if "video" in manual_heads:
+            manual_heads = manual_heads.loc[video_mask(manual_heads.video, Path(a.video).name)]
+        if "exclude" in manual_heads:
+            manual_heads = manual_heads.loc[~manual_heads.exclude.map(as_bool)]
+        if len(manual_heads):
+            manual_heads = manual_heads.drop_duplicates("frame", keep="last").set_index("frame")
     rows = []; i = 0
     while True:
         ok, frame = cap.read()
@@ -160,6 +173,9 @@ def main() -> None:
             break
         if k:
             frame = np.rot90(frame, k)  # everything below works in rotated space
+        reflection = learned_head = None
+        head_source = "excluded" if i in excluded else "missing"
+        disagreement = np.nan
         if i in excluded:
             body = head = None; conf = 0.0; overlay = frame.copy()
             cv2.rectangle(overlay, (0, 0), (overlay.shape[1] - 1, overlay.shape[0] - 1), (0, 0, 220), 6)
@@ -176,8 +192,6 @@ def main() -> None:
                 prob = torch.sigmoid(mask_logits)[0, 0].cpu().numpy()
                 head_prob = torch.sigmoid(head_logits)[0, 0].cpu().numpy() if head_logits is not None else None
             filtered = temporal.update(prob, a.threshold)
-            if filtered.status == "acquired":
-                learned_head_ema = None
             if filtered.centroid is not None:
                 mask_src = cv2.resize(filtered.mask, (frame.shape[1], frame.shape[0]),
                                       interpolation=cv2.INTER_NEAREST)
@@ -200,22 +214,41 @@ def main() -> None:
                     # dilated clean body mask so a highlight on the fibre
                     # cannot become the head. Old checkpoints fall back to
                     # the reflection tracker.
+                    learned_conf = 0.0
                     if head_prob is not None:
                         allowed = cv2.dilate(filtered.mask,
                                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 0
                         constrained = np.where(allowed, head_prob, 0.0)
-                        conf = float(constrained.max())
-                        if conf >= 0.20:
+                        learned_conf = float(constrained.max())
+                        if learned_conf >= 0.20:
                             yy, xx = np.unravel_index(int(constrained.argmax()), constrained.shape)
                             src_head = np.asarray([[[xx * frame.shape[1] / size,
                                                     yy * frame.shape[0] / size]]], np.float32)
                             hp = cv2.perspectiveTransform(src_head, forward)[0, 0]
-                            learned_head_ema = hp if learned_head_ema is None else .72 * learned_head_ema + .28 * hp
-                            head = tuple(float(v) for v in learned_head_ema)
+                            learned_head = tuple(float(v) for v in hp)
+                    reflection, reflection_conf, _ = tracker.update(rect, background, body, body_mask)
+                    manual = manual_heads.loc[i] if i in manual_heads.index else None
+                    if manual is not None and as_bool(manual.get("reflection_present", True)):
+                        rx = pd.to_numeric(manual.get("reflection_x_cm"), errors="coerce")
+                        ry = pd.to_numeric(manual.get("reflection_y_cm"), errors="coerce")
+                        if np.isfinite([rx, ry]).all():
+                            reflection = (float(rx) / a.arena_width_cm * (rw - 1),
+                                          float(ry) / a.arena_height_cm * (rh - 1))
+                            tracker.position = np.asarray(reflection, np.float32)
+                            tracker.relative = tracker.position - np.asarray(body, np.float32)
+                            reflection_conf = 1.0
+                    if manual is not None and as_bool(manual.get("head_present", True)):
+                        hx = pd.to_numeric(manual.get("head_x_cm"), errors="coerce")
+                        hy = pd.to_numeric(manual.get("head_y_cm"), errors="coerce")
+                        if np.isfinite([hx, hy]).all():
+                            head = (float(hx) / a.arena_width_cm * (rw - 1),
+                                    float(hy) / a.arena_height_cm * (rh - 1))
+                            conf = 1.0; head_source = "manual_override"
                     if head is None:
-                        head, conf, status = tracker.update(rect, background, body, body_mask)
-                        if head is not None:
-                            head = tuple(float(v) for v in head)
+                        choice = choose_head(reflection, reflection_conf,
+                                             learned_head, learned_conf)
+                        head, conf, head_source = choice.point, choice.confidence, choice.source
+                        disagreement = choice.disagreement_px if choice.disagreement_px is not None else np.nan
                 else:
                     body = None; head = None; conf = 0.0
             overlay = frame.copy()
@@ -233,6 +266,9 @@ def main() -> None:
                     h_px = cv2.perspectiveTransform(np.asarray([[head]], np.float32), inverse)[0, 0].astype(int)
                     cv2.circle(overlay, tuple(h_px), 7, (0, 220, 255), -1, cv2.LINE_AA)
                     cv2.line(overlay, tuple(b_px), tuple(h_px), (255, 255, 255), 1, cv2.LINE_AA)
+                if reflection is not None:
+                    r_px = cv2.perspectiveTransform(np.asarray([[reflection]], np.float32), inverse)[0, 0].astype(int)
+                    cv2.circle(overlay, tuple(r_px), 4, (255, 0, 255), 1, cv2.LINE_AA)
         overlay_write = np.rot90(overlay, -k) if k else overlay
         if mask_src is None:
             mask_write = np.zeros((h, w), np.uint8)
@@ -242,17 +278,25 @@ def main() -> None:
         mw.write(cv2.cvtColor(mask_write, cv2.COLOR_GRAY2BGR))
         body_cm = rectified_to_cm(body, rw, rh, a.arena_width_cm, a.arena_height_cm) if body else (float("nan"), float("nan"))
         head_cm = rectified_to_cm(head, rw, rh, a.arena_width_cm, a.arena_height_cm) if head else (float("nan"), float("nan"))
-        rows.append((i, i / fps, body_cm[0], body_cm[1], head_cm[0], head_cm[1], conf))
+        reflection_cm = rectified_to_cm(reflection, rw, rh, a.arena_width_cm, a.arena_height_cm) if reflection else (float("nan"), float("nan"))
+        learned_cm = rectified_to_cm(learned_head, rw, rh, a.arena_width_cm, a.arena_height_cm) if learned_head else (float("nan"), float("nan"))
+        rows.append((i, i / fps, body_cm[0], body_cm[1], head_cm[0], head_cm[1], conf,
+                     reflection_cm[0], reflection_cm[1], learned_cm[0], learned_cm[1],
+                     head_source, disagreement))
         i += 1
     cap.release(); ow.release(); mw.release()
     df = pd.DataFrame(rows, columns=["frame", "timestamp_sec", "body_x_cm", "body_y_cm",
-                                     "head_x_cm", "head_y_cm", "head_confidence"])
+                                     "head_x_cm", "head_y_cm", "head_confidence",
+                                     "reflection_x_cm", "reflection_y_cm",
+                                     "learned_head_x_cm", "learned_head_y_cm",
+                                     "head_source", "head_disagreement_px"])
     df.to_csv(out / "head_track_trajectory.csv", index=False, float_format="%.5f")
     (out / "head_track_metadata.json").write_text(json.dumps(
         {"input": str(Path(a.video).resolve()), "model": str(Path(a.model).resolve()),
          "device": dev, "frames": i, "threshold": a.threshold, "rotate": a.rotate,
          "bg_subtract": bg_small is not None, "in_channels": in_channels,
-         "head_source": "learned_heatmap_with_reflection_fallback" if pack.get("head_output") else "reflection",
+         "head_policy": "reflection_primary_learned_fallback",
+         "head_source_counts": {str(k): int(v) for k, v in df.head_source.value_counts().items()},
          "fibre_aware_temporal_filter": True,
          "fibre_opening": a.fibre_opening, "reacquire_sec": a.reacquire_sec,
          "floor_bounds": list(floor) if floor is not None else None, "model_size": size,

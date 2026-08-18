@@ -6,7 +6,8 @@ import unittest
 
 import pandas as pd
 
-from label_compat import as_bool, atomic_upsert_polygon, normalize_polygon, video_matches
+from label_compat import (as_bool, atomic_upsert_head, atomic_upsert_polygon,
+                          normalize_polygon, video_matches)
 
 
 class LabelCompatibilityTests(unittest.TestCase):
@@ -48,6 +49,15 @@ class LabelCompatibilityTests(unittest.TestCase):
         row = result.loc[result.video == "video.avi"].iloc[0]
         self.assertEqual(normalize_polygon(row.polygon_px).tolist(),
                          [[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]])
+
+    def test_atomic_head_pair_update(self):
+        folder = Path(tempfile.mkdtemp()); labels = folder / "heads.csv"
+        atomic_upsert_head(labels, "video.avi", 12, .4, (4.2, 5.3), (4.0, 5.0))
+        atomic_upsert_head(labels, "video.avi", 12, .4, (4.4, 5.5), (4.1, 5.1))
+        result = pd.read_csv(labels)
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result.head_x_cm.iloc[0], 4.4)
+        self.assertTrue(labels.with_suffix(".csv.bak").is_file())
 
 
 if __name__ == "__main__":

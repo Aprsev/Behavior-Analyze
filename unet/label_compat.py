@@ -92,3 +92,46 @@ def atomic_upsert_polygon(path: str | Path, video: str | Path, frame: int,
         shutil.copy2(path, backup)
     temporary.replace(path)
     return backup
+
+
+def atomic_upsert_head(path: str | Path, video: str | Path, frame: int,
+                       timestamp_sec: float, head, reflection,
+                       exclude: bool = False,
+                       source: str = "head_result_correction") -> Path:
+    """Atomically upsert one manual head/reflection pair across many videos."""
+    path = Path(path)
+    columns = ["frame", "timestamp_sec", "head_x_cm", "head_y_cm",
+               "reflection_x_cm", "reflection_y_cm", "exclude",
+               "reflection_present", "head_present", "video", "source"]
+    try:
+        old = pd.read_csv(path) if path.is_file() else pd.DataFrame(columns=columns)
+    except pd.errors.EmptyDataError:
+        old = pd.DataFrame(columns=columns)
+    if "video" not in old:
+        old["video"] = Path(video).name
+    if "frame" not in old:
+        old["frame"] = np.nan
+    matches = video_mask(old.video, video) & (pd.to_numeric(old.frame, errors="coerce") == int(frame))
+    previous = old.loc[matches].iloc[-1].to_dict() if matches.any() else {}
+    h = np.asarray(head, float) if head is not None else np.asarray([np.nan, np.nan])
+    r = np.asarray(reflection, float) if reflection is not None else np.asarray([np.nan, np.nan])
+    previous.update({"frame": int(frame), "timestamp_sec": float(timestamp_sec),
+                     "head_x_cm": h[0], "head_y_cm": h[1],
+                     "reflection_x_cm": r[0], "reflection_y_cm": r[1],
+                     "exclude": bool(exclude), "reflection_present": bool(np.isfinite(r).all()),
+                     "head_present": bool(np.isfinite(h).all()), "video": Path(video).name,
+                     "source": source})
+    merged = pd.concat([old.loc[~matches], pd.DataFrame([previous])], ignore_index=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    backup = path.with_suffix(path.suffix + ".bak")
+    merged.to_csv(temporary, index=False, float_format="%.5f")
+    check = pd.read_csv(temporary)
+    saved = video_mask(check.video, video) & (pd.to_numeric(check.frame, errors="coerce") == int(frame))
+    if saved.sum() != 1:
+        temporary.unlink(missing_ok=True)
+        raise IOError(f"head save verification failed for {Path(video).name} frame {frame}")
+    if path.is_file():
+        shutil.copy2(path, backup)
+    temporary.replace(path)
+    return backup
