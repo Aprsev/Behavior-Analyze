@@ -375,9 +375,14 @@ legacy path/polygon formats; **查看上次重建样本** separately checks the 
 **复查/修正已有轮廓** on the advanced tab to overwrite an incorrect old label.
 Closing that review window automatically rebuilds the current video's dataset,
 so newly excluded frames and corrected masks cannot remain as stale PNGs.
-In the contact sheet, double-click a thumbnail to open a large editor. Drag a
-point or click an edge to add one; every completed edit is atomically saved to
-the CSV and the contact-sheet page refreshes when the editor closes.
+In the contact sheet, double-click a thumbnail and choose either the body
+contour editor or the Head/Reflection editor. In the keypoint editor, press
+`H` or `R` to select the active point, then click/drag to correct it; `C`
+confirms the active point without moving it, `X` marks Reflection absent, `N`
+marks Head absent, and `S` saves and closes. Completed edits are atomically
+saved to the relevant CSV and the contact-sheet page refreshes immediately
+when the editor closes. A corrected CSV point replaces the stale exported
+heatmap in the preview; rebuild the dataset before the next training run.
 
 U-Net v3 has three supervised outputs: mouse/miniscope mask, anatomical Head
 heatmap, and Reflection heatmap. Existing `head_anchor_calibration.csv` rows

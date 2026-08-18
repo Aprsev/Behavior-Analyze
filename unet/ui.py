@@ -366,15 +366,19 @@ class App:
         """Open the paginated contact sheet without blocking this GUI."""
         if not self._sync_args():
             return
-        videos = [Path(cfg["video"]) for cfg in self.videos if Path(cfg["video"]).is_file()]
         if not (self.args.dataset / "images").is_dir() and not self.args.labels.is_file():
             messagebox.showerror("没有标注", "未找到训练数据集，也未找到多边形标注 CSV。")
             return
         argv = [sys.executable, str(Path(__file__).with_name("view_annotations.py")),
                 "--dataset", str(self.args.dataset), "--labels", str(self.args.labels),
+                "--heads", str(self.args.heads),
+                "--arena-width-cm", str(self.args.arena_width_cm),
+                "--arena-height-cm", str(self.args.arena_height_cm),
                 "--source", source]
-        for video in videos:
-            argv.extend(["--video", str(video)])
+        for cfg in self.videos:
+            video = Path(cfg["video"])
+            if video.is_file():
+                argv.extend(["--video", str(video), "--roi-json", str(self.roi_path(cfg))])
         try:
             flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             subprocess.Popen(argv, creationflags=flags)

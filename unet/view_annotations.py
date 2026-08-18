@@ -22,7 +22,7 @@ import pandas as pd
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import messagebox, ttk
-from label_compat import as_bool, normalize_polygon, video_matches
+from label_compat import as_bool, normalize_polygon, video_matches, video_mask
 
 
 class ContactSheet:
@@ -33,6 +33,12 @@ class ContactSheet:
     def __init__(self, root: tk.Tk, args: argparse.Namespace):
         self.root, self.args = root, args
         self.dataset = Path(args.dataset)
+        self.rois = {str(Path(video).resolve()): Path(roi)
+                     for video, roi in zip(args.video, args.roi_json)
+                     if roi and Path(roi).is_file()}
+        self.video_sizes: dict[str, tuple[float, float]] = {}
+        self.roi_inverses: dict[str, np.ndarray] = {}
+        self._reload_heads()
         self.items = self._load_items()
         self.page = 0
         self.editing = False
@@ -40,7 +46,7 @@ class ContactSheet:
         self.page_var = tk.StringVar()
         self.mode_var = tk.StringVar(value=self.mode)
         self.details_var = tk.StringVar(value=getattr(self, "csv_stats", f"共 {len(self.items)} 张"))
-        self.edit_status_var = tk.StringVar(value="双击任意缩略图：放大编辑；拖动结束即自动保存到 CSV")
+        self.edit_status_var = tk.StringVar(value="双击缩略图：选择编辑轮廓或 Head/Reflection；拖动结束自动保存")
         self._build()
         self.root.after(10, self.render)
 
@@ -75,6 +81,7 @@ class ContactSheet:
                  if video_matches(record.get("video", key[0]), path) or video_matches(key[0], path)), None)
             items.append({"kind": "dataset", "name": name, "key": key,
                           "video": video, "frame": key[1],
+                          "roi": self._roi_for(video),
                           "initial_mask": self.dataset / "masks" / name})
         return items
 
@@ -121,6 +128,7 @@ class ContactSheet:
             frame = int(row.frame)
             items.append({"kind": "raw", "name": f"{video.name} · frame {frame}",
                           "video": video, "frame": frame, "polygon": polygon,
+                          "roi": self._roi_for(video),
                           "key": (video.stem.replace(" ", "_"), frame)})
         excluded_rows = rows.iloc[0:0]
         if "exclude" in original:
@@ -133,7 +141,7 @@ class ContactSheet:
     def _load_items(self) -> list[dict]:
         raw, dataset = self._raw_items(), self._dataset_items()
         if self.args.source == "dataset":
-            self.mode = "上次重建的训练数据（绿色=mask，红色=head）"
+            self.mode = "上次重建的训练数据（绿色=mask，红色=Head，紫色=Reflection）"
             return dataset
         if self.args.source == "all":
             raw_keys = {item["key"] for item in raw}
@@ -145,10 +153,74 @@ class ContactSheet:
             self.csv_stats += f"；历史补充 {len(historical)}；合计 {len(raw) + len(historical)}"
             return raw + historical
         if raw:
-            self.mode = "当前 CSV 原始标注（绿色=轮廓；保存后立即反映）"
+            self.mode = "当前 CSV 原始标注（绿色=轮廓，红色=Head，紫色=Reflection）"
             return raw
         self.mode = "当前 CSV 无法读取，回退到上次重建的训练数据"
         return dataset
+
+    def _roi_for(self, video) -> Path | None:
+        if video is None:
+            return None
+        resolved = str(Path(video).resolve())
+        if resolved in self.rois:
+            return self.rois[resolved]
+        return next((roi for configured, roi in self.rois.items()
+                     if video_matches(configured, video)), None)
+
+    def _reload_heads(self) -> None:
+        try:
+            self.head_rows = (pd.read_csv(self.args.heads) if self.args.heads and
+                              Path(self.args.heads).is_file() else pd.DataFrame())
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            self.head_rows = pd.DataFrame()
+
+    def _head_row(self, item: dict):
+        rows = self.head_rows
+        if rows.empty or "video" not in rows or "frame" not in rows or item.get("video") is None:
+            return None
+        matches = (video_mask(rows["video"], item["video"]) &
+                   (pd.to_numeric(rows["frame"], errors="coerce") == item["frame"]))
+        return rows.loc[matches].iloc[-1] if matches.any() else None
+
+    def _csv_point_px(self, item: dict, prefix: str, image_shape) -> tuple[int, int] | None:
+        row, roi_path = self._head_row(item), item.get("roi")
+        if row is None or roi_path is None or not Path(roi_path).is_file():
+            return None
+        try:
+            x = float(row[f"{prefix}_x_cm"]); y = float(row[f"{prefix}_y_cm"])
+            if not np.isfinite([x, y]).all():
+                return None
+            roi_key = str(Path(roi_path).resolve())
+            inverse = self.roi_inverses.get(roi_key)
+            if inverse is None:
+                roi = json.loads(Path(roi_path).read_text(encoding="utf-8"))
+                corners = np.asarray(roi["arena_corners_px"], np.float32)
+                dst = np.asarray([[0, 0], [self.args.arena_width_cm, 0],
+                                  [self.args.arena_width_cm, self.args.arena_height_cm],
+                                  [0, self.args.arena_height_cm]], np.float32)
+                inverse = cv2.getPerspectiveTransform(dst, corners)
+                self.roi_inverses[roi_key] = inverse
+            source = cv2.perspectiveTransform(np.asarray([[[x, y]]], np.float32), inverse)[0, 0]
+            if item["kind"] == "dataset":
+                video_key = str(Path(item["video"]).resolve())
+                if video_key not in self.video_sizes:
+                    cap = cv2.VideoCapture(str(item["video"]))
+                    self.video_sizes[video_key] = (cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+                                                   cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    cap.release()
+                source_w, source_h = self.video_sizes[video_key]
+                return (int(round(source[0] * image_shape[1] / max(source_w, 1))),
+                        int(round(source[1] * image_shape[0] / max(source_h, 1))))
+            return tuple(np.rint(source).astype(int))
+        except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError, cv2.error):
+            return None
+
+    def _draw_csv_points(self, image: np.ndarray, item: dict) -> None:
+        for prefix, color in (("head", (255, 30, 30)), ("reflection", (255, 0, 255))):
+            point = self._csv_point_px(item, prefix, image.shape)
+            if point is not None:
+                cv2.circle(image, point, 6 if prefix == "head" else 5, color, -1, cv2.LINE_AA)
+                cv2.circle(image, point, 9 if prefix == "head" else 8, (255, 255, 255), 1, cv2.LINE_AA)
 
     def _build(self) -> None:
         self.root.title("已标注数据 · 分页拼接预览")
@@ -191,24 +263,26 @@ class ContactSheet:
         # call imread for an absent file: OpenCV 5 prints one warning per
         # thumbnail, which looks like a data failure even though the sample is
         # still valid for mask training.
+        csv_head = self._csv_point_px(item, "head", image.shape)
+        csv_reflection = self._csv_point_px(item, "reflection", image.shape)
         head_path = self.dataset / "heads" / name
         head = (cv2.imread(str(head_path), cv2.IMREAD_GRAYSCALE)
                 if head_path.is_file() else None)
-        if head is not None and head.max() > 0:
+        if csv_head is None and head is not None and head.max() > 0:
             _, _, _, point = cv2.minMaxLoc(head)
             cv2.circle(image, point, 6, (255, 30, 30), -1, cv2.LINE_AA)
             cv2.circle(image, point, 9, (255, 255, 255), 1, cv2.LINE_AA)
         reflection_path = self.dataset / "reflections" / name
         reflection = (cv2.imread(str(reflection_path), cv2.IMREAD_GRAYSCALE)
                       if reflection_path.is_file() else None)
-        if reflection is not None and reflection.max() > 0:
+        if csv_reflection is None and reflection is not None and reflection.max() > 0:
             _, _, _, point = cv2.minMaxLoc(reflection)
             cv2.circle(image, point, 5, (255, 0, 255), -1, cv2.LINE_AA)
             cv2.circle(image, point, 8, (255, 255, 255), 1, cv2.LINE_AA)
+        self._draw_csv_points(image, item)
         return image
 
-    @staticmethod
-    def _raw_image(item: dict, captures: dict[Path, cv2.VideoCapture]) -> np.ndarray | None:
+    def _raw_image(self, item: dict, captures: dict[Path, cv2.VideoCapture]) -> np.ndarray | None:
         video = item["video"]
         cap = captures.setdefault(video, cv2.VideoCapture(str(video)))
         cap.set(cv2.CAP_PROP_POS_FRAMES, item["frame"])
@@ -216,7 +290,9 @@ class ContactSheet:
         if not ok:
             return None
         cv2.polylines(frame, [item["polygon"]], True, (20, 235, 70), 3, cv2.LINE_AA)
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._draw_csv_points(image, item)
+        return image
 
     def render(self) -> None:
         for child in self.grid.winfo_children():
@@ -270,19 +346,41 @@ class ContactSheet:
         if self.editing:
             messagebox.showinfo("编辑器已打开", "请先关闭当前大图编辑器。")
             return
-        if self.args.source == "dataset":
-            messagebox.showinfo("只读训练样本", "请从“拼接查看全部已有标注”进入修改；此处用于审计上次重建结果。")
-            return
         video = item.get("video")
         if video is None or not Path(video).is_file():
             messagebox.showerror("找不到源视频", "该历史样本的原视频路径在本主机不可用。\n请先把对应视频添加到主界面的视频列表。")
             return
-        command = [sys.executable, str(Path(__file__).with_name("edit_polygon_label.py")),
-                   "--video", str(video), "--frame", str(item["frame"]),
-                   "--labels", str(self.args.labels)]
-        initial_mask = item.get("initial_mask")
-        if initial_mask and Path(initial_mask).is_file():
-            command.extend(["--initial-mask", str(initial_mask)])
+        choice = messagebox.askyesnocancel(
+            "选择编辑内容",
+            "编辑哪一类标注？\n\n是：Head / Reflection 坐标点\n否：小鼠身体轮廓\n取消：返回拼接预览")
+        if choice is None:
+            return
+        if choice:
+            roi = item.get("roi")
+            if not self.args.heads:
+                messagebox.showerror("缺少头部标签文件", "主界面没有提供 Head/Reflection CSV 路径。")
+                return
+            if roi is None or not Path(roi).is_file():
+                messagebox.showerror("缺少 ROI", "找不到该视频对应的 ROI JSON，无法换算 cm 坐标。")
+                return
+            command = [sys.executable, str(Path(__file__).with_name("edit_keypoint_label.py")),
+                       "--video", str(video), "--frame", str(item["frame"]),
+                       "--heads", str(self.args.heads), "--roi-json", str(roi),
+                       "--arena-width-cm", str(self.args.arena_width_cm),
+                       "--arena-height-cm", str(self.args.arena_height_cm)]
+            if item["kind"] == "dataset":
+                for flag, folder in (("--initial-head", "heads"),
+                                     ("--initial-reflection", "reflections")):
+                    initial = self.dataset / folder / item["name"]
+                    if initial.is_file():
+                        command.extend([flag, str(initial)])
+        else:
+            command = [sys.executable, str(Path(__file__).with_name("edit_polygon_label.py")),
+                       "--video", str(video), "--frame", str(item["frame"]),
+                       "--labels", str(self.args.labels)]
+            initial_mask = item.get("initial_mask")
+            if initial_mask and Path(initial_mask).is_file():
+                command.extend(["--initial-mask", str(initial_mask)])
         self.editing = True
 
         def worker():
@@ -298,6 +396,7 @@ class ContactSheet:
         if returncode:
             messagebox.showerror("标注编辑失败", stderr.strip() or stdout.strip() or f"exit {returncode}")
             return
+        self._reload_heads()
         self.items = self._load_items()
         self.mode_var.set(self.mode)
         self.details_var.set(getattr(self, "csv_stats", f"共 {len(self.items)} 张"))
@@ -309,7 +408,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--labels", required=True)
+    parser.add_argument("--heads", default="")
     parser.add_argument("--video", action="append", default=[])
+    parser.add_argument("--roi-json", action="append", default=[])
+    parser.add_argument("--arena-width-cm", type=float, default=25.0)
+    parser.add_argument("--arena-height-cm", type=float, default=30.0)
     parser.add_argument("--source", choices=("all", "csv", "dataset"), default="all")
     args = parser.parse_args()
     root = tk.Tk()
