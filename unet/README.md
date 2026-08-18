@@ -257,6 +257,20 @@ python unet/train.py --dataset "unet/datasets/project" --output-dir "unet/models
 python unet/infer.py --video "data/video.avi" --model "unet/models/project/best_unet.pt" --output-dir "results/video_unet" --threshold 0.5 --exclude-csv "traditional/results/screening.csv"
 ```
 
+When a legacy Mask+Head checkpoint is upgraded with a new Reflection decoder,
+training runs in reflection-safe mode. The existing Mask and Head output layers
+are frozen, BatchNorm statistics remain fixed, shared layers use a 100x lower
+learning rate than the new Reflection layer, and the source checkpoint acts as
+a teacher consistency target. Reflection heatmaps also receive an explicit
+coordinate loss so that a plausible blob on the fibre or tail is penalized.
+
+Promotion is regression-gated. A candidate is selected automatically only if
+its comparable Mask+Head score is at least the baseline score, Dice drops by no
+more than 0.002, Head error increases by no more than 1 px, and all active
+keypoint errors remain within their readiness limits. A rejected checkpoint is
+retained as `candidate_unet_reflection_*.pt` for inspection; the selected source
+model and every pre-existing `.pt` file remain unchanged.
+
 Outputs of inference include `mouse_miniscope_mask.mp4`,
 `mouse_miniscope_overlay.mp4`, and `unet_trajectory.csv`. The trajectory
 contains the CNN mask centroid; it is a clean body input for the later

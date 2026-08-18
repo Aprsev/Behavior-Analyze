@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from model import UNet, load_compatible_weights, unpack_outputs
+from model import UNet, checkpoint_model, load_compatible_weights, unpack_outputs
 from postprocess import model_input
 
 BG_GAIN = 2.0
@@ -199,7 +199,20 @@ def point_heatmap_loss(logits, target, valid):
     distribution = flat_target / flat_target.sum(1, keepdim=True).clamp_min(1e-6)
     log_probability = F.log_softmax(logits.flatten(1), dim=1)
     localization = -(distribution * log_probability).sum(1) / np.log(logits[0].numel())
-    per_sample = localization + 0.25 * shape_loss
+    # Penalize the coordinate itself, not just heatmap appearance. This gives
+    # sparse Reflection labels a strong gradient even when the predicted blob
+    # has roughly the right shape but sits on the fibre or tail.
+    height, width = target.shape[-2:]
+    x_axis = torch.linspace(0, 1, width, device=logits.device)
+    y_axis = torch.linspace(0, 1, height, device=logits.device)
+    predicted_distribution = F.softmax(logits.flatten(1), dim=1).reshape(-1, height, width)
+    target_distribution = distribution.reshape(-1, height, width)
+    predicted_xy = torch.stack(((predicted_distribution.sum(1) * x_axis).sum(1),
+                                (predicted_distribution.sum(2) * y_axis).sum(1)), dim=1)
+    target_xy = torch.stack(((target_distribution.sum(1) * x_axis).sum(1),
+                             (target_distribution.sum(2) * y_axis).sum(1)), dim=1)
+    coordinate_loss = ((predicted_xy - target_xy) ** 2).sum(1)
+    per_sample = localization + 0.25 * shape_loss + 2.0 * coordinate_loss
     return (per_sample * valid).sum() / valid.sum().clamp_min(1)
 
 
@@ -276,6 +289,7 @@ def main():
     base_path = Path(a.base_model) if a.base_model else out / "best_unet.pt"
     old = None
     base_had_head = base_had_reflection = False
+    teacher = None; teacher_source_channel = 0
     if base_path.is_file() and not a.fresh:
         old = torch.load(base_path, map_location="cpu")
         base_had_head = bool(old.get("head_output", False))
@@ -284,6 +298,11 @@ def main():
         loaded = load_compatible_weights(model, old["state_dict"], source_channel=source_channel)
         resumed = bool(loaded)
         print(f"Warm-started {len(loaded)} tensors from {base_path.name}; source checkpoint remains unchanged")
+        if resumed:
+            teacher = checkpoint_model(old, device=device).eval()
+            teacher_source_channel = source_channel
+            for parameter in teacher.parameters():
+                parameter.requires_grad_(False)
 
     kw = dict(num_workers=2, pin_memory=device == "cuda")
     train_loader = DataLoader(Pairs(root, train_files, True, backgrounds, in_channels),
@@ -298,19 +317,32 @@ def main():
         print(f"Current checkpoint on this validation split: Dice {baseline_dice:.5f}; "
               f"head {baseline_head_error}; reflection {baseline_reflection_error}")
     if resumed:
+        reflection_upgrade = reflection_output and not base_had_reflection
         new_point_parameters = []
         if head_output and not base_had_head and model.head_out is not None:
             new_point_parameters.extend(model.head_out.parameters())
         if reflection_output and not base_had_reflection and model.reflection_out is not None:
             new_point_parameters.extend(model.reflection_out.parameters())
         new_ids = {id(parameter) for parameter in new_point_parameters}
+        # Keep already-good output heads bit-identical while the new
+        # Reflection decoder learns. Shared features may adapt very slowly and
+        # are additionally protected by teacher consistency below.
+        if reflection_upgrade:
+            for layer in (model.out, model.head_out):
+                if layer is not None:
+                    for parameter in layer.parameters():
+                        parameter.requires_grad_(False)
         inherited_parameters = [parameter for parameter in model.parameters()
-                                if id(parameter) not in new_ids]
-        groups = [{"params": inherited_parameters, "lr": min(a.lr, 2e-4)}]
+                                if id(parameter) not in new_ids and parameter.requires_grad]
+        inherited_lr = min(a.lr, 2e-5 if reflection_upgrade else 2e-4)
+        groups = [{"params": inherited_parameters, "lr": inherited_lr}]
         if new_point_parameters:
             groups.append({"params": new_point_parameters, "lr": a.lr})
             print(f"Using LR {a.lr:g} for {len(new_point_parameters)} new point-layer tensors; "
-                  f"inherited layers use {min(a.lr, 2e-4):g}")
+                  f"inherited layers use {inherited_lr:g}")
+        if reflection_upgrade:
+            print("Reflection-safe upgrade: Mask/Head output layers frozen; "
+                  "teacher consistency protects inherited predictions")
         optimizer = torch.optim.AdamW(groups, weight_decay=1e-4)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
@@ -319,6 +351,12 @@ def main():
     best_reflection_error = None; history = []
     for epoch in range(1, a.epochs + 1):
         model.train(); losses = []
+        if resumed and reflection_output and not base_had_reflection:
+            # Updating BatchNorm running statistics alone can damage the old
+            # model even at a tiny learning rate.
+            for module in model.modules():
+                if isinstance(module, torch.nn.BatchNorm2d):
+                    module.eval()
         for x, mask, head, valid, reflection, reflection_valid in train_loader:
             x, mask = x.to(device), mask.to(device)
             head, valid = head.to(device), valid.to(device)
@@ -330,8 +368,20 @@ def main():
             if head_logits is not None and valid.any():
                 loss = loss + 0.45 * point_heatmap_loss(head_logits, head, valid)
             if reflection_logits is not None and reflection_valid.any():
-                loss = loss + 0.40 * point_heatmap_loss(
+                loss = loss + 0.65 * point_heatmap_loss(
                     reflection_logits, reflection, reflection_valid)
+            if teacher is not None and reflection_output and not base_had_reflection:
+                teacher_x = x
+                if teacher.in_channels == 1:
+                    teacher_x = x[:, teacher_source_channel:teacher_source_channel + 1]
+                with torch.no_grad():
+                    teacher_mask, teacher_head, _ = unpack_outputs(teacher(teacher_x))
+                preservation = F.mse_loss(torch.sigmoid(mask_logits),
+                                          torch.sigmoid(teacher_mask))
+                if head_logits is not None and teacher_head is not None:
+                    preservation = preservation + 0.5 * F.mse_loss(
+                        torch.sigmoid(head_logits), torch.sigmoid(teacher_head))
+                loss = loss + 1.0 * preservation
             optimizer.zero_grad(); loss.backward(); optimizer.step(); losses.append(float(loss.item()))
         val_dice, head_error, reflection_error = evaluate(model, val_loader, device)
         score = validation_score(val_dice, head_error, reflection_error, sample_size)
@@ -356,9 +406,30 @@ def main():
     head_ready = not head_output or (best_head_error is not None and best_head_error <= 18.0)
     reflection_ready = (not reflection_output or
                         (best_reflection_error is not None and best_reflection_error <= 18.0))
-    promoted = head_ready and reflection_ready and (not resumed or
-                (best_score >= baseline_score if base_had_reflection
-                 else best >= baseline_dice - 0.01))
+    # Compare only capabilities that exist in both models. A freshly-created,
+    # random Reflection layer must not make the baseline look better or worse.
+    baseline_comparable_score = validation_score(
+        baseline_dice, baseline_head_error,
+        baseline_reflection_error if base_had_reflection else None,
+        sample_size) if resumed else -1.0
+    candidate_comparable_score = validation_score(
+        best, best_head_error,
+        best_reflection_error if base_had_reflection else None,
+        sample_size)
+    dice_safe = not resumed or best >= baseline_dice - 0.002
+    head_safe = (not resumed or baseline_head_error is None or best_head_error is None or
+                 best_head_error <= baseline_head_error + 1.0)
+    reflection_safe = (not resumed or not base_had_reflection or
+                       baseline_reflection_error is None or best_reflection_error is None or
+                       best_reflection_error <= baseline_reflection_error + 1.0)
+    comparable_improved = not resumed or candidate_comparable_score >= baseline_comparable_score
+    promoted = (head_ready and reflection_ready and dice_safe and head_safe and
+                reflection_safe and comparable_improved)
+    if resumed:
+        print("Promotion audit: "
+              f"comparable {baseline_comparable_score:.5f} -> {candidate_comparable_score:.5f}; "
+              f"dice_safe={dice_safe}; head_safe={head_safe}; "
+              f"reflection_safe={reflection_safe}")
     if promoted:
         if promoted_path.exists():
             raise FileExistsError(f"Refusing to overwrite {promoted_path}")
@@ -371,8 +442,18 @@ def main():
             reasons.append(f"Head error {best_head_error} > 18 px")
         if not reflection_ready:
             reasons.append(f"Reflection error {best_reflection_error} > 18 px")
+        if not dice_safe:
+            reasons.append(f"Dice regressed {baseline_dice:.5f} -> {best:.5f}")
+        if not head_safe:
+            reasons.append(f"Head regressed {baseline_head_error:.2f} -> {best_head_error:.2f} px")
+        if not reflection_safe:
+            reasons.append(f"Reflection regressed {baseline_reflection_error:.2f} -> "
+                           f"{best_reflection_error:.2f} px")
+        if not comparable_improved:
+            reasons.append(f"comparable score {candidate_comparable_score:.5f} < "
+                           f"baseline {baseline_comparable_score:.5f}")
         if not reasons:
-            reasons.append("combined validation score did not improve")
+            reasons.append("promotion safety gate failed")
         print(f"Kept selected source model unchanged ({'; '.join(reasons)}); "
               f"candidate retained at {candidate_path}")
     (out / "training_history.json").write_text(json.dumps(
@@ -384,6 +465,11 @@ def main():
          "baseline_val_dice": baseline_dice, "baseline_head_error_px": baseline_head_error,
          "baseline_reflection_error_px": baseline_reflection_error,
          "baseline_selection_score": baseline_score,
+         "baseline_comparable_score": baseline_comparable_score,
+         "candidate_comparable_score": candidate_comparable_score,
+         "dice_safe": dice_safe, "head_safe": head_safe,
+         "reflection_safe": reflection_safe, "comparable_improved": comparable_improved,
+         "reflection_safe_upgrade": bool(resumed and reflection_output and not base_had_reflection),
          "candidate_promoted": promoted,
          "model_output": str(promoted_path.resolve()) if promoted else "",
          "candidate_model": str(candidate_path.resolve()) if not promoted else "",
