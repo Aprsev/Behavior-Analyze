@@ -379,9 +379,23 @@ In the contact sheet, double-click a thumbnail to open a large editor. Drag a
 point or click an edge to add one; every completed edit is atomically saved to
 the CSV and the contact-sheet page refreshes when the editor closes.
 
-Head tracking is reflection-first: the physical reflection is used whenever
-available, the learned heatmap may only make a small agreeing correction, and
-acts alone only when reflection is missing. After a full analysis, use
+U-Net v3 has three supervised outputs: mouse/miniscope mask, anatomical Head
+heatmap, and Reflection heatmap. Existing `head_anchor_calibration.csv` rows
+provide both point targets, so upgrading does not require relabelling. The
+learned Reflection is fused with the legacy bright-spot detector; old mask-only
+and Mask+Head checkpoints remain loadable and automatically use the legacy
+detector. A learned Reflection branch is enabled for inference only when its
+saved validation error is available and no greater than 18 px.
+
+Training never overwrites a checkpoint. Each successful run creates a file
+such as `best_unet_reflection_YYYYMMDD_HHMMSS_microseconds.pt`; the model chosen
+before training is read only as a warm-start source, and the GUI automatically
+selects the newly promoted file. Model selection uses Mask Dice together with
+Head and Reflection errors instead of Mask Dice alone.
+
+Head tracking remains reflection-anchored: the fused Reflection is used when
+available, the anatomical Head heatmap may make an agreeing correction, and
+acts alone when Reflection is missing. After a full analysis, use
 **根据结果补充 Head 标记** to correct automatically selected low-confidence or
 high-disagreement frames; the accepted green mask is snapshotted alongside the
 head label so it can supervise the next training run.

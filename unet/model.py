@@ -1,4 +1,4 @@
-"""Small multi-task U-Net for mouse/miniscope segmentation and head heatmap."""
+"""Backward-compatible multi-task U-Net for mask and keypoint heatmaps."""
 from __future__ import annotations
 import torch
 from torch import nn
@@ -12,19 +12,20 @@ class Block(nn.Module):
 
 
 class UNet(nn.Module):
-    """U-Net with a backward-compatible optional head-point decoder.
+    """U-Net with backward-compatible optional point decoders.
 
     Old checkpoints used one grayscale channel and only ``out``.  New
     checkpoints use two channels (raw grayscale + background residual) and
-    may additionally predict a head heatmap.  Keeping the architecture in one
-    class lets the loader migrate useful weights from old models.
+    may additionally predict Head and Reflection heatmaps. Keeping the
+    architecture in one class lets the loader migrate useful old weights.
     """
 
     def __init__(self, base: int = 24, in_channels: int = 1,
-                 head_output: bool = False):
+                 head_output: bool = False, reflection_output: bool = False):
         super().__init__()
         self.in_channels = int(in_channels)
-        self.head_output = bool(head_output)
+        self.reflection_output = bool(reflection_output)
+        self.head_output = bool(head_output or self.reflection_output)
         self.e1=Block(self.in_channels,base); self.e2=Block(base,base*2); self.e3=Block(base*2,base*4)
         self.pool=nn.MaxPool2d(2); self.mid=Block(base*4,base*8)
         self.u3=nn.ConvTranspose2d(base*8,base*4,2,2); self.d3=Block(base*8,base*4)
@@ -32,20 +33,37 @@ class UNet(nn.Module):
         self.u1=nn.ConvTranspose2d(base*2,base,2,2); self.d1=Block(base*2,base)
         self.out=nn.Conv2d(base,1,1)
         self.head_out = nn.Conv2d(base, 1, 1) if self.head_output else None
+        self.reflection_out = nn.Conv2d(base, 1, 1) if self.reflection_output else None
     def forward(self,x):
         a=self.e1(x); b=self.e2(self.pool(a)); c=self.e3(self.pool(b)); m=self.mid(self.pool(c))
         x=self.d3(torch.cat([self.u3(m),c],1)); x=self.d2(torch.cat([self.u2(x),b],1)); x=self.d1(torch.cat([self.u1(x),a],1))
         mask = self.out(x)
         if self.head_out is None:
             return mask
-        return mask, self.head_out(x)
+        head = self.head_out(x)
+        if self.reflection_out is None:
+            return mask, head
+        return mask, head, self.reflection_out(x)
+
+
+def unpack_outputs(output):
+    """Normalize legacy/new forward results to mask, head, reflection."""
+    if not isinstance(output, tuple):
+        return output, None, None
+    if len(output) == 2:
+        return output[0], output[1], None
+    if len(output) == 3:
+        return output
+    raise ValueError(f"Unsupported U-Net output count: {len(output)}")
 
 
 def checkpoint_model(package: dict, device="cpu") -> UNet:
     """Build and load the exact architecture recorded in a checkpoint."""
     in_channels = int(package.get("in_channels", 2 if package.get("dual_channel") else 1))
     head_output = bool(package.get("head_output", False))
-    model = UNet(in_channels=in_channels, head_output=head_output).to(device)
+    reflection_output = bool(package.get("reflection_output", False))
+    model = UNet(in_channels=in_channels, head_output=head_output,
+                 reflection_output=reflection_output).to(device)
     model.load_state_dict(package["state_dict"])
     return model
 

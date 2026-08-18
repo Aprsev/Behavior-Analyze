@@ -114,7 +114,7 @@ def apply_dialogs(v: dict, mode: str) -> dict:
         v["dataset"] = Path(pick_dir("Select dataset dir (with images/ and masks/)", v["dataset"]) or v["dataset"])
     if mode in ("infer", "head"):
         v["video"] = Path(pick_file("Select source video", v["video"].parent, "*.avi *.mp4 *.mov *.mkv") or v["video"])
-        v["model"] = Path(pick_file("Select best_unet.pt", v["model"].parent, "*.pt") or v["model"])
+        v["model"] = Path(pick_file("Select U-Net checkpoint", v["model"].parent, "*.pt") or v["model"])
         v["infer_out"] = Path(pick_dir("Select inference output dir", v["infer_out"]) or v["infer_out"])
     if mode == "head":
         v["roi"] = pick_or_create_roi(v["video"])
@@ -158,10 +158,13 @@ def prepare_cmd(cfg: dict, w: str, h: str, a) -> tuple[Path, list[str]]:
 
 
 def train_cmd(v: dict, a) -> tuple[Path, list[str]]:
-    return UNET / "train.py", [
+    argv = [
         "--dataset", str(v["dataset"]), "--output-dir", str(v["model"].parent),
         "--epochs", str(a.epochs), "--batch-size", str(a.batch_size),
         "--lr", f"{a.lr:g}"]
+    if Path(v["model"]).is_file():
+        argv.extend(["--base-model", str(v["model"])])
+    return UNET / "train.py", argv
 
 
 def calibrate_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:

@@ -221,13 +221,15 @@ class App:
                 d = json.loads(history.read_text(encoding="utf-8"))
                 promoted = "已晋升" if d.get("candidate_promoted", True) else "保留旧模型"
                 self.training_summary_var.set(
-                    f"模型可用｜候选 Dice {100 * float(d['best_val_dice']):.1f}%｜{promoted}｜"
+                    f"模型可用｜Dice {100 * float(d['best_val_dice']):.1f}%｜"
+                    f"Head {d.get('best_head_error_px', '?')} px｜"
+                    f"Reflection {d.get('best_reflection_error_px', '?')} px｜{promoted}｜"
                     f"训练 {d.get('train_count', '?')} / 验证 {d.get('val_count', '?')}")
             except (OSError, json.JSONDecodeError, KeyError, ValueError):
                 self.training_summary_var.set("模型文件存在")
         else:
             self.training_summary_var.set("模型不存在：请先训练或选择 checkpoint")
-        self.root.title(f"Behavior Analyze · U-Net v2 — {video.name}")
+        self.root.title(f"Behavior Analyze · U-Net v3 — {video.name}")
 
     # -------------------------------------------------------------- commands
     def _training_cfgs(self) -> list[dict]:
@@ -253,7 +255,7 @@ class App:
         if not self.roi_path().is_file():
             messagebox.showerror("缺少 ROI", "请先点击“框选 ROI”或选择已有 ROI JSON。"); return False
         if not self.args.model.is_file():
-            messagebox.showerror("缺少模型", "请选择可用的 best_unet.pt，或先在训练页训练。"); return False
+            messagebox.showerror("缺少模型", "请选择可用的 U-Net checkpoint，或先在训练页训练。"); return False
         return True
 
     def analyze(self) -> None:
@@ -265,7 +267,7 @@ class App:
 
     def mask_preview(self) -> None:
         if not self._sync_args() or not self.args.model.is_file():
-            messagebox.showerror("缺少模型", "请选择可用的 best_unet.pt。"); return
+            messagebox.showerror("缺少模型", "请选择可用的 U-Net checkpoint。"); return
         self.args.infer_out.mkdir(parents=True, exist_ok=True)
         self.run_commands([R.infer_cmd(self.make_v(), self.args)], "仅分割预览")
 
@@ -343,10 +345,14 @@ class App:
             name = Path(cfg["video"]).name
             torso_rows = labels.loc[labels.video.map(lambda value: video_matches(value, name))] if "video" in labels else labels
             head_rows = heads.loc[heads.video.map(lambda value: video_matches(value, name))] if "video" in heads else heads
+            head_present = int(head_rows.get("head_present", pd.Series(True, index=head_rows.index)).map(
+                lambda value: str(value).strip().casefold() in {"1", "true", "yes", "y"}).sum())
+            reflection_present = int(head_rows.get("reflection_present", pd.Series(True, index=head_rows.index)).map(
+                lambda value: str(value).strip().casefold() in {"1", "true", "yes", "y"}).sum())
             torso_excluded = int(torso_rows.exclude.map(lambda value: str(value).strip().casefold() in
                                  {"1", "true", "yes", "y", "excluded"}).sum()) if "exclude" in torso_rows else 0
             lines.append(f"{name}\n  torso: {len(torso_rows)}（排除 {torso_excluded}）"
-                         f"    head/reflection: {len(head_rows)}")
+                         f"    Head: {head_present}    Reflection: {reflection_present}")
         messagebox.showinfo("现有标注统计", "\n\n".join(lines) if lines else "没有标注记录")
 
     def view_annotations(self, source: str = "all") -> None:
@@ -547,6 +553,11 @@ class App:
         self.log_text.see(tk.END)
 
     def _consume_training_json(self, line: str) -> None:
+        if line.startswith("MODEL_OUTPUT="):
+            model = Path(line.split("=", 1)[1].strip())
+            self.model_var.set(str(model)); self.args.model = model
+            self.log(f"GUI 已自动选择新模型：{model.name}\n")
+            return
         if '"epoch"' not in line or '"train_loss"' not in line: return
         try: row = json.loads(line.strip())
         except json.JSONDecodeError: return
@@ -590,7 +601,7 @@ class App:
         style = ttk.Style(); style.configure("Primary.TButton", font=("Microsoft YaHei UI", 11, "bold"))
 
         header = ttk.Frame(root); header.pack(fill="x", padx=10, pady=(8, 4))
-        ttk.Label(header, text="Behavior Analyze · Fibre-aware U-Net", font=("Microsoft YaHei UI", 15, "bold")).pack(side="left")
+        ttk.Label(header, text="Behavior Analyze · Fibre-aware U-Net v3", font=("Microsoft YaHei UI", 15, "bold")).pack(side="left")
         ttk.Label(header, textvariable=self.status_var, foreground="#165d9c", font=FONT).pack(side="left", padx=18)
         self.progress = ttk.Progressbar(header, mode="indeterminate", length=180); self.progress.pack(side="left", padx=6)
         self.stop_button = ttk.Button(header, text="停止任务", command=self.stop, state="disabled"); self.stop_button.pack(side="right")

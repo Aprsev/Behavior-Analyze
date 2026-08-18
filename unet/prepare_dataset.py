@@ -68,9 +68,10 @@ def main():
     print(f'Label audit for {Path(a.video).name}: matched={matched_label_count}, '
           f'usable={len(labels)}, excluded_union={len(excluded)}, '
           f'label_excluded={len(label_excluded)}, screening_excluded={len(screening_excluded)}')
-    out = Path(a.output_dir); images = out / 'images'; masks = out / 'masks'; head_dir = out / 'heads'
+    out = Path(a.output_dir); images = out / 'images'; masks = out / 'masks'
+    head_dir = out / 'heads'; reflection_dir = out / 'reflections'
     images.mkdir(parents=True, exist_ok=True); masks.mkdir(parents=True, exist_ok=True)
-    head_dir.mkdir(parents=True, exist_ok=True)
+    head_dir.mkdir(parents=True, exist_ok=True); reflection_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(a.video).stem.replace(' ', '_')
     heads = pd.DataFrame()
     if a.heads and Path(a.heads).is_file():
@@ -111,20 +112,27 @@ def main():
         # stored in arena cm, converted through the same ROI calibration back
         # to source pixels, then represented as a smooth heatmap.
         head_map = np.zeros((a.size, a.size), np.uint8)
+        reflection_map = np.zeros((a.size, a.size), np.uint8)
         if inverse is not None and frame_index in heads.index:
             hr = heads.loc[frame_index]
-            hx = pd.to_numeric(hr.get('head_x_cm'), errors='coerce')
-            hy = pd.to_numeric(hr.get('head_y_cm'), errors='coerce')
-            present = as_bool(hr.get('head_present', True))
-            if present and np.isfinite(hx) and np.isfinite(hy):
-                rect_pt = np.asarray([[[float(hx) / a.arena_width_cm * (rect_w - 1),
-                                        float(hy) / a.arena_height_cm * (rect_h - 1)]]], np.float32)
+            def labelled_map(prefix: str, present_column: str) -> np.ndarray:
+                x_cm = pd.to_numeric(hr.get(f'{prefix}_x_cm'), errors='coerce')
+                y_cm = pd.to_numeric(hr.get(f'{prefix}_y_cm'), errors='coerce')
+                present = as_bool(hr.get(present_column, True))
+                if not present or not np.isfinite([x_cm, y_cm]).all():
+                    return np.zeros((a.size, a.size), np.uint8)
+                rect_pt = np.asarray([[[float(x_cm) / a.arena_width_cm * (rect_w - 1),
+                                        float(y_cm) / a.arena_height_cm * (rect_h - 1)]]], np.float32)
                 sx, sy = cv2.perspectiveTransform(rect_pt, inverse)[0, 0]
                 px = float(sx) * a.size / frame.shape[1]
                 py = float(sy) * a.size / frame.shape[0]
                 if 0 <= px < a.size and 0 <= py < a.size:
-                    head_map = gaussian_heatmap(a.size, px, py)
+                    return gaussian_heatmap(a.size, px, py)
+                return np.zeros((a.size, a.size), np.uint8)
+            head_map = labelled_map('head', 'head_present')
+            reflection_map = labelled_map('reflection', 'reflection_present')
         cv2.imwrite(str(head_dir / name), head_map)
+        cv2.imwrite(str(reflection_dir / name), reflection_map)
         written.append(frame_index)
     cap.release()
 
@@ -133,7 +141,7 @@ def main():
     # silently kept training on them.
     wanted = {f'{stem}_{frame_index:07d}.png' for frame_index in written}
     removed = 0
-    for folder in (images, masks, head_dir):
+    for folder in (images, masks, head_dir, reflection_dir):
         for path in folder.glob(f'{stem}_???????.png'):
             if path.name not in wanted and path.is_file():
                 path.unlink()
@@ -151,13 +159,16 @@ def main():
     else:
         print(f'WARNING: background estimation failed for {Path(a.video).name}; '
               f'train.py will use raw frames for this video')
+    head_count = int(sum(has_head_heatmap(head_dir / name) for name in wanted))
+    reflection_count = int(sum(has_head_heatmap(reflection_dir / name) for name in wanted))
     manifest = {'video': str(Path(a.video).resolve()), 'count': len(written), 'size': a.size,
                 'frames': written, 'samples': sorted(wanted), 'stem': stem,
                 'source_label_count': matched_label_count,
                 'label_excluded_frames': sorted(label_excluded),
                 'screening_excluded_frames': sorted(screening_excluded),
                 'excluded_frames': sorted(excluded),
-                'head_count': int(sum(has_head_heatmap(head_dir / name) for name in wanted)),
+                'head_count': head_count,
+                'reflection_count': reflection_count,
                 'background': str(bg_path) if bg is not None else ''}
     if (out / 'dataset.json').exists():
         old = json.loads((out / 'dataset.json').read_text(encoding='utf-8'))
@@ -169,7 +180,8 @@ def main():
     else:
         videos = [manifest]
     (out / 'dataset.json').write_text(json.dumps({'size': a.size, 'videos': videos}, indent=2), encoding='utf-8')
-    print(f'Wrote {len(written)} image/mask pairs from {Path(a.video).name} to {out} (total videos: {len(videos)})')
+    print(f'Wrote {len(written)} image/mask pairs from {Path(a.video).name} to {out} '
+          f'(head labels {head_count}; reflection labels {reflection_count}; total videos: {len(videos)})')
 
 if __name__ == '__main__':
     main()

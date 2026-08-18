@@ -13,6 +13,42 @@ class HeadChoice:
     disagreement_px: float | None
 
 
+def choose_reflection(heuristic, heuristic_confidence: float,
+                      learned, learned_confidence: float,
+                      agreement_px: float = 20.0) -> HeadChoice:
+    """Fuse the learned reflection heatmap with the legacy bright-spot cue.
+
+    The learned point is preferred when confident.  The heuristic remains a
+    backward-compatible fallback for old checkpoints and dim/unlabelled
+    appearances. Agreement raises confidence; disagreement is exposed in the
+    source/diagnostics instead of being hidden.
+    """
+    h = np.asarray(heuristic, float) if heuristic is not None else None
+    l = np.asarray(learned, float) if learned is not None else None
+    h_ok = h is not None and np.isfinite(h).all()
+    l_ok = l is not None and np.isfinite(l).all()
+    if l_ok and h_ok:
+        disagreement = float(np.linalg.norm(l - h))
+        if disagreement <= agreement_px:
+            weight = float(np.clip(0.55 + learned_confidence, 0.60, 0.85))
+            point = weight * l + (1.0 - weight) * h
+            return HeadChoice(tuple(map(float, point)),
+                              float(max(learned_confidence, heuristic_confidence)),
+                              "reflection_model_consensus", disagreement)
+        if learned_confidence >= 0.20:
+            return HeadChoice(tuple(map(float, l)), float(learned_confidence),
+                              "reflection_model_disagrees", disagreement)
+        return HeadChoice(tuple(map(float, h)), float(heuristic_confidence),
+                          "reflection_heuristic_disagrees", disagreement)
+    if l_ok and learned_confidence >= 0.05:
+        return HeadChoice(tuple(map(float, l)), float(learned_confidence),
+                          "reflection_model", None)
+    if h_ok:
+        return HeadChoice(tuple(map(float, h)), float(heuristic_confidence),
+                          "reflection_heuristic", None)
+    return HeadChoice(None, 0.0, "reflection_missing", None)
+
+
 def choose_head(reflection, reflection_confidence: float,
                 learned, learned_confidence: float,
                 agreement_px: float = 18.0,

@@ -2,11 +2,21 @@
 import unittest
 import numpy as np
 import pandas as pd
-from head_fusion import HeadChoice, HeadTemporalStabilizer, choose_head
+from head_fusion import HeadChoice, HeadTemporalStabilizer, choose_head, choose_reflection
 from annotate_head_results import select_frames
 
 
 class HeadFusionTests(unittest.TestCase):
+    def test_reflection_model_replaces_disagreeing_heuristic_when_confident(self):
+        result = choose_reflection((100, 100), .8, (10, 10), .7)
+        self.assertEqual(result.source, "reflection_model_disagrees")
+        self.assertEqual(result.point, (10., 10.))
+
+    def test_old_checkpoint_still_uses_heuristic_reflection(self):
+        result = choose_reflection((10, 10), .6, None, 0)
+        self.assertEqual(result.source, "reflection_heuristic")
+        self.assertEqual(result.point, (10., 10.))
+
     def test_wrong_learned_point_cannot_replace_reflection(self):
         result = choose_head((10, 10), .7, (100, 100), .99)
         self.assertEqual(result.source, "reflection")

@@ -198,6 +198,13 @@ class ContactSheet:
             _, _, _, point = cv2.minMaxLoc(head)
             cv2.circle(image, point, 6, (255, 30, 30), -1, cv2.LINE_AA)
             cv2.circle(image, point, 9, (255, 255, 255), 1, cv2.LINE_AA)
+        reflection_path = self.dataset / "reflections" / name
+        reflection = (cv2.imread(str(reflection_path), cv2.IMREAD_GRAYSCALE)
+                      if reflection_path.is_file() else None)
+        if reflection is not None and reflection.max() > 0:
+            _, _, _, point = cv2.minMaxLoc(reflection)
+            cv2.circle(image, point, 5, (255, 0, 255), -1, cv2.LINE_AA)
+            cv2.circle(image, point, 8, (255, 255, 255), 1, cv2.LINE_AA)
         return image
 
     @staticmethod

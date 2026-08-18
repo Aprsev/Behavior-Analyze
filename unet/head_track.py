@@ -29,8 +29,9 @@ from compare_head_methods import ReflectionTracker  # noqa: E402
 from mouse_behavior_pipeline import (  # noqa: E402
     perspective_geometry, rectified_to_cm, robust_threshold, sample_frames, video_properties,
 )
-from model import checkpoint_model  # noqa: E402
-from head_fusion import HeadChoice, HeadTemporalStabilizer, choose_head  # noqa: E402
+from model import checkpoint_model, unpack_outputs  # noqa: E402
+from head_fusion import (HeadChoice, HeadTemporalStabilizer, choose_head,
+                         choose_reflection)  # noqa: E402
 from label_compat import as_bool, video_mask  # noqa: E402
 from preprocess import estimate_background  # noqa: E402
 from postprocess import TemporalMaskFilter, model_input  # noqa: E402
@@ -99,6 +100,19 @@ def main() -> None:
     in_channels = int(pack.get("in_channels", 2 if pack.get("dual_channel") else 1))
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     net = checkpoint_model(pack, dev); net.eval()
+    reflection_validation_error = pack.get("reflection_error_px")
+    learned_reflection_enabled = bool(pack.get("reflection_output", False)) and \
+        reflection_validation_error is not None and np.isfinite(reflection_validation_error) and \
+        float(reflection_validation_error) <= 18.0
+    if bool(pack.get("reflection_output", False)):
+        if learned_reflection_enabled:
+            print(f"Learned reflection branch enabled (validation error "
+                  f"{float(reflection_validation_error):.2f} px)")
+        else:
+            print("WARNING: reflection branch lacks acceptable validation accuracy; "
+                  "using legacy bright-spot fallback")
+    else:
+        print("Legacy checkpoint without reflection branch; using bright-spot tracker")
 
     corners = load_corners(Path(a.roi_json))
     cap = cv2.VideoCapture(a.video)
@@ -174,7 +188,10 @@ def main() -> None:
             break
         if k:
             frame = np.rot90(frame, k)  # everything below works in rotated space
-        reflection = learned_head = None
+        reflection = learned_head = learned_reflection = None
+        reflection_source = "excluded" if i in excluded else "reflection_missing"
+        reflection_disagreement = np.nan
+        reflection_conf = learned_reflection_conf = 0.0
         head_source = "excluded" if i in excluded else "missing"
         disagreement = np.nan
         if i in excluded:
@@ -189,9 +206,11 @@ def main() -> None:
             x = torch.from_numpy(channels[None].copy()).float().to(dev) / 255
             with torch.no_grad():
                 output = net(x)
-                mask_logits, head_logits = output if isinstance(output, tuple) else (output, None)
+                mask_logits, head_logits, reflection_logits = unpack_outputs(output)
                 prob = torch.sigmoid(mask_logits)[0, 0].cpu().numpy()
                 head_prob = torch.sigmoid(head_logits)[0, 0].cpu().numpy() if head_logits is not None else None
+                reflection_prob = (torch.sigmoid(reflection_logits)[0, 0].cpu().numpy()
+                                   if reflection_logits is not None and learned_reflection_enabled else None)
             filtered = temporal.update(prob, a.threshold)
             if filtered.centroid is not None:
                 mask_src = cv2.resize(filtered.mask, (frame.shape[1], frame.shape[0]),
@@ -216,9 +235,9 @@ def main() -> None:
                     # cannot become the head. Old checkpoints fall back to
                     # the reflection tracker.
                     learned_conf = 0.0
+                    allowed = cv2.dilate(filtered.mask,
+                                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 0
                     if head_prob is not None:
-                        allowed = cv2.dilate(filtered.mask,
-                                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 0
                         constrained = np.where(allowed, head_prob, 0.0)
                         learned_conf = float(constrained.max())
                         # Always retain the in-mask argmax as a candidate.
@@ -231,25 +250,57 @@ def main() -> None:
                                                     yy * frame.shape[0] / size]]], np.float32)
                             hp = cv2.perspectiveTransform(src_head, forward)[0, 0]
                             learned_head = tuple(float(v) for v in hp)
-                    reflection, reflection_conf, _ = tracker.update(rect, background, body, body_mask)
+                    if reflection_prob is not None:
+                        constrained_reflection = np.where(allowed, reflection_prob, 0.0)
+                        learned_reflection_conf = float(constrained_reflection.max())
+                        if np.isfinite(learned_reflection_conf) and allowed.any():
+                            ryy, rxx = np.unravel_index(
+                                int(constrained_reflection.argmax()), constrained_reflection.shape)
+                            src_reflection = np.asarray(
+                                [[[rxx * frame.shape[1] / size,
+                                   ryy * frame.shape[0] / size]]], np.float32)
+                            rp = cv2.perspectiveTransform(src_reflection, forward)[0, 0]
+                            learned_reflection = tuple(float(v) for v in rp)
+                    heuristic_reflection, heuristic_conf, _ = tracker.update(
+                        rect, background, body, body_mask)
+                    reflection_choice = choose_reflection(
+                        heuristic_reflection, heuristic_conf,
+                        learned_reflection, learned_reflection_conf)
+                    reflection = reflection_choice.point
+                    reflection_conf = reflection_choice.confidence
+                    reflection_source = reflection_choice.source
+                    reflection_disagreement = (reflection_choice.disagreement_px
+                                               if reflection_choice.disagreement_px is not None else np.nan)
+                    if reflection is not None and reflection_source.startswith("reflection_model"):
+                        tracker.position = np.asarray(reflection, np.float32)
+                        tracker.relative = tracker.position - np.asarray(body, np.float32)
                     manual = manual_heads.loc[i] if i in manual_heads.index else None
-                    if manual is not None and as_bool(manual.get("reflection_present", True)):
-                        rx = pd.to_numeric(manual.get("reflection_x_cm"), errors="coerce")
-                        ry = pd.to_numeric(manual.get("reflection_y_cm"), errors="coerce")
-                        if np.isfinite([rx, ry]).all():
-                            reflection = (float(rx) / a.arena_width_cm * (rw - 1),
-                                          float(ry) / a.arena_height_cm * (rh - 1))
-                            tracker.position = np.asarray(reflection, np.float32)
-                            tracker.relative = tracker.position - np.asarray(body, np.float32)
-                            reflection_conf = 1.0
-                    if manual is not None and as_bool(manual.get("head_present", True)):
-                        hx = pd.to_numeric(manual.get("head_x_cm"), errors="coerce")
-                        hy = pd.to_numeric(manual.get("head_y_cm"), errors="coerce")
-                        if np.isfinite([hx, hy]).all():
-                            head = (float(hx) / a.arena_width_cm * (rw - 1),
-                                    float(hy) / a.arena_height_cm * (rh - 1))
-                            conf = 1.0; head_source = "manual_override"
-                    if head is None:
+                    manual_head_absent = False
+                    if manual is not None:
+                        if as_bool(manual.get("reflection_present", True)):
+                            rx = pd.to_numeric(manual.get("reflection_x_cm"), errors="coerce")
+                            ry = pd.to_numeric(manual.get("reflection_y_cm"), errors="coerce")
+                            if np.isfinite([rx, ry]).all():
+                                reflection = (float(rx) / a.arena_width_cm * (rw - 1),
+                                              float(ry) / a.arena_height_cm * (rh - 1))
+                                tracker.position = np.asarray(reflection, np.float32)
+                                tracker.relative = tracker.position - np.asarray(body, np.float32)
+                                reflection_conf = 1.0
+                                reflection_source = "manual_reflection"
+                        else:
+                            reflection = None; reflection_conf = 0.0
+                            reflection_source = "manual_reflection_absent"
+                        if as_bool(manual.get("head_present", True)):
+                            hx = pd.to_numeric(manual.get("head_x_cm"), errors="coerce")
+                            hy = pd.to_numeric(manual.get("head_y_cm"), errors="coerce")
+                            if np.isfinite([hx, hy]).all():
+                                head = (float(hx) / a.arena_width_cm * (rw - 1),
+                                        float(hy) / a.arena_height_cm * (rh - 1))
+                                conf = 1.0; head_source = "manual_override"
+                        else:
+                            manual_head_absent = True
+                            head = None; conf = 0.0; head_source = "manual_head_absent"
+                    if head is None and not manual_head_absent:
                         choice = choose_head(reflection, reflection_conf,
                                              learned_head, learned_conf)
                         choice = head_temporal.update(body, choice)
@@ -279,6 +330,14 @@ def main() -> None:
                 if reflection is not None:
                     r_px = cv2.perspectiveTransform(np.asarray([[reflection]], np.float32), inverse)[0, 0].astype(int)
                     cv2.circle(overlay, tuple(r_px), 4, (255, 0, 255), 1, cv2.LINE_AA)
+                if learned_reflection is not None:
+                    lr_px = cv2.perspectiveTransform(
+                        np.asarray([[learned_reflection]], np.float32), inverse)[0, 0].astype(int)
+                    cv2.drawMarker(overlay, tuple(lr_px), (255, 255, 0),
+                                   cv2.MARKER_CROSS, 7, 1, cv2.LINE_AA)
+                cv2.putText(overlay, f"R {reflection_source} {reflection_conf:.2f}",
+                            (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .48,
+                            (255, 255, 255), 1, cv2.LINE_AA)
         overlay_write = np.rot90(overlay, -k) if k else overlay
         if mask_src is None:
             mask_write = np.zeros((h, w), np.uint8)
@@ -290,8 +349,13 @@ def main() -> None:
         head_cm = rectified_to_cm(head, rw, rh, a.arena_width_cm, a.arena_height_cm) if head else (float("nan"), float("nan"))
         reflection_cm = rectified_to_cm(reflection, rw, rh, a.arena_width_cm, a.arena_height_cm) if reflection else (float("nan"), float("nan"))
         learned_cm = rectified_to_cm(learned_head, rw, rh, a.arena_width_cm, a.arena_height_cm) if learned_head else (float("nan"), float("nan"))
+        learned_reflection_cm = rectified_to_cm(
+            learned_reflection, rw, rh, a.arena_width_cm, a.arena_height_cm
+        ) if learned_reflection else (float("nan"), float("nan"))
         rows.append((i, i / fps, body_cm[0], body_cm[1], head_cm[0], head_cm[1], conf,
                      reflection_cm[0], reflection_cm[1], learned_cm[0], learned_cm[1],
+                     learned_reflection_cm[0], learned_reflection_cm[1],
+                     learned_reflection_conf, reflection_source, reflection_disagreement,
                      head_source, disagreement))
         i += 1
     cap.release(); ow.release(); mw.release()
@@ -299,6 +363,9 @@ def main() -> None:
                                      "head_x_cm", "head_y_cm", "head_confidence",
                                      "reflection_x_cm", "reflection_y_cm",
                                      "learned_head_x_cm", "learned_head_y_cm",
+                                     "learned_reflection_x_cm", "learned_reflection_y_cm",
+                                     "learned_reflection_confidence", "reflection_source",
+                                     "reflection_disagreement_px",
                                      "head_source", "head_disagreement_px"])
     df.to_csv(out / "head_track_trajectory.csv", index=False, float_format="%.5f")
     (out / "head_track_metadata.json").write_text(json.dumps(
@@ -307,11 +374,18 @@ def main() -> None:
          "bg_subtract": bg_small is not None, "in_channels": in_channels,
          "head_policy": "reflection_primary_temporal_learned_fallback",
          "head_source_counts": {str(k): int(v) for k, v in df.head_source.value_counts().items()},
+         "reflection_policy": ("learned_primary_heuristic_fallback"
+                               if learned_reflection_enabled
+                               else "legacy_heuristic"),
+         "reflection_model_validation_error_px": reflection_validation_error,
+         "reflection_source_counts": {str(k): int(v) for k, v in df.reflection_source.value_counts().items()},
          "fibre_aware_temporal_filter": True,
          "fibre_opening": a.fibre_opening, "reacquire_sec": a.reacquire_sec,
          "floor_bounds": list(floor) if floor is not None else None, "model_size": size,
          "body_valid_percent": round(100 * float(df.body_x_cm.notna().mean()), 2),
          "reflection_valid_percent": round(100 * float(df.reflection_x_cm.notna().mean()), 2),
+         "learned_reflection_candidate_percent": round(
+             100 * float(df.learned_reflection_x_cm.notna().mean()), 2),
          "learned_candidate_percent": round(100 * float(df.learned_head_x_cm.notna().mean()), 2),
          "head_valid_percent": round(100 * float(df.head_x_cm.notna().mean()), 2),
          "head_reliable_percent": round(100 * float((df.head_x_cm.notna() &
@@ -320,10 +394,12 @@ def main() -> None:
     body_rate = df.body_x_cm.notna().mean()
     reflection_rate = df.reflection_x_cm.notna().mean()
     learned_rate = df.learned_head_x_cm.notna().mean()
+    learned_reflection_rate = df.learned_reflection_x_cm.notna().mean()
     head_rate = df.head_x_cm.notna().mean()
     reliable_rate = (df.head_x_cm.notna() & (df.head_confidence >= 0.20)).mean()
     print(f"Wrote {i} frames to {out}; body {body_rate:.1%}; "
-          f"reflection {reflection_rate:.1%}; learned candidate {learned_rate:.1%}; "
+          f"reflection {reflection_rate:.1%}; learned reflection {learned_reflection_rate:.1%}; "
+          f"learned head {learned_rate:.1%}; "
           f"head valid {head_rate:.1%}; reliable {reliable_rate:.1%}")
 
 
