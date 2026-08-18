@@ -258,11 +258,14 @@ python unet/infer.py --video "data/video.avi" --model "unet/models/project/best_
 ```
 
 When a legacy Mask+Head checkpoint is upgraded with a new Reflection decoder,
-training runs in reflection-safe mode. The existing Mask and Head output layers
-are frozen, BatchNorm statistics remain fixed, shared layers use a 100x lower
-learning rate than the new Reflection layer, and the source checkpoint acts as
-a teacher consistency target. Reflection heatmaps also receive an explicit
-coordinate loss so that a plausible blob on the fibre or tail is penalized.
+training runs in reflection-isolated mode. The complete inherited network and
+BatchNorm statistics are frozen, while a versioned two-convolution Reflection
+refinement branch trains independently. Mask and Head therefore remain exactly
+the source model rather than being softly encouraged to stay close. Reflection
+heatmaps also receive an explicit coordinate loss so that a plausible blob on
+the fibre or tail is penalized. Checkpoint v4 records this branch explicitly;
+v1 mask-only, v2 Mask+Head, and v3 single-layer Reflection files remain directly
+loadable.
 
 Promotion is regression-gated. A candidate is selected automatically only if
 its comparable Mask+Head score is at least the baseline score, Dice drops by no

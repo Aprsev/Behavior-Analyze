@@ -21,10 +21,12 @@ class UNet(nn.Module):
     """
 
     def __init__(self, base: int = 24, in_channels: int = 1,
-                 head_output: bool = False, reflection_output: bool = False):
+                 head_output: bool = False, reflection_output: bool = False,
+                 reflection_refine: bool = False):
         super().__init__()
         self.in_channels = int(in_channels)
         self.reflection_output = bool(reflection_output)
+        self.reflection_refine_enabled = bool(reflection_output and reflection_refine)
         self.head_output = bool(head_output or self.reflection_output)
         self.e1=Block(self.in_channels,base); self.e2=Block(base,base*2); self.e3=Block(base*2,base*4)
         self.pool=nn.MaxPool2d(2); self.mid=Block(base*4,base*8)
@@ -33,6 +35,10 @@ class UNet(nn.Module):
         self.u1=nn.ConvTranspose2d(base*2,base,2,2); self.d1=Block(base*2,base)
         self.out=nn.Conv2d(base,1,1)
         self.head_out = nn.Conv2d(base, 1, 1) if self.head_output else None
+        self.reflection_refine = (nn.Sequential(
+            nn.Conv2d(base, base, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(base, base, 3, padding=1), nn.ReLU(inplace=True))
+            if self.reflection_refine_enabled else None)
         self.reflection_out = nn.Conv2d(base, 1, 1) if self.reflection_output else None
     def forward(self,x):
         a=self.e1(x); b=self.e2(self.pool(a)); c=self.e3(self.pool(b)); m=self.mid(self.pool(c))
@@ -43,7 +49,8 @@ class UNet(nn.Module):
         head = self.head_out(x)
         if self.reflection_out is None:
             return mask, head
-        return mask, head, self.reflection_out(x)
+        reflection_features = self.reflection_refine(x) if self.reflection_refine is not None else x
+        return mask, head, self.reflection_out(reflection_features)
 
 
 def unpack_outputs(output):
@@ -62,8 +69,10 @@ def checkpoint_model(package: dict, device="cpu") -> UNet:
     in_channels = int(package.get("in_channels", 2 if package.get("dual_channel") else 1))
     head_output = bool(package.get("head_output", False))
     reflection_output = bool(package.get("reflection_output", False))
+    reflection_refine = bool(package.get("reflection_refine", False))
     model = UNet(in_channels=in_channels, head_output=head_output,
-                 reflection_output=reflection_output).to(device)
+                 reflection_output=reflection_output,
+                 reflection_refine=reflection_refine).to(device)
     model.load_state_dict(package["state_dict"])
     return model
 

@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from model import UNet, checkpoint_model, load_compatible_weights, unpack_outputs
+from model import UNet, load_compatible_weights, unpack_outputs
 from postprocess import model_input
 
 BG_GAIN = 2.0
@@ -277,8 +277,6 @@ def main():
         raise ValueError("Training/validation split is empty")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = UNet(in_channels=in_channels, head_output=head_output,
-                 reflection_output=reflection_output).to(device)
     out = Path(a.output_dir); out.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     candidate_path = out / f"candidate_unet_reflection_{stamp}.pt"
@@ -289,20 +287,22 @@ def main():
     base_path = Path(a.base_model) if a.base_model else out / "best_unet.pt"
     old = None
     base_had_head = base_had_reflection = False
-    teacher = None; teacher_source_channel = 0
     if base_path.is_file() and not a.fresh:
         old = torch.load(base_path, map_location="cpu")
         base_had_head = bool(old.get("head_output", False))
         base_had_reflection = bool(old.get("reflection_output", False))
+    reflection_upgrade = bool(reflection_output and not base_had_reflection)
+    reflection_refine = bool(
+        reflection_output and (reflection_upgrade or
+                               (old is not None and old.get("reflection_refine", False))))
+    model = UNet(in_channels=in_channels, head_output=head_output,
+                 reflection_output=reflection_output,
+                 reflection_refine=reflection_refine).to(device)
+    if old is not None:
         source_channel = 1 if bool(old.get("bg_subtract")) else 0
         loaded = load_compatible_weights(model, old["state_dict"], source_channel=source_channel)
         resumed = bool(loaded)
         print(f"Warm-started {len(loaded)} tensors from {base_path.name}; source checkpoint remains unchanged")
-        if resumed:
-            teacher = checkpoint_model(old, device=device).eval()
-            teacher_source_channel = source_channel
-            for parameter in teacher.parameters():
-                parameter.requires_grad_(False)
 
     kw = dict(num_workers=2, pin_memory=device == "cuda")
     train_loader = DataLoader(Pairs(root, train_files, True, backgrounds, in_channels),
@@ -317,32 +317,34 @@ def main():
         print(f"Current checkpoint on this validation split: Dice {baseline_dice:.5f}; "
               f"head {baseline_head_error}; reflection {baseline_reflection_error}")
     if resumed:
-        reflection_upgrade = reflection_output and not base_had_reflection
         new_point_parameters = []
         if head_output and not base_had_head and model.head_out is not None:
             new_point_parameters.extend(model.head_out.parameters())
         if reflection_output and not base_had_reflection and model.reflection_out is not None:
             new_point_parameters.extend(model.reflection_out.parameters())
+            if model.reflection_refine is not None:
+                new_point_parameters.extend(model.reflection_refine.parameters())
         new_ids = {id(parameter) for parameter in new_point_parameters}
-        # Keep already-good output heads bit-identical while the new
-        # Reflection decoder learns. Shared features may adapt very slowly and
-        # are additionally protected by teacher consistency below.
+        # A first-time Reflection upgrade is an isolated side branch. Freezing
+        # every inherited tensor guarantees that Mask and Head logits remain
+        # bit-identical to the source checkpoint.
         if reflection_upgrade:
-            for layer in (model.out, model.head_out):
-                if layer is not None:
-                    for parameter in layer.parameters():
-                        parameter.requires_grad_(False)
+            for name, parameter in model.named_parameters():
+                parameter.requires_grad_(id(parameter) in new_ids)
         inherited_parameters = [parameter for parameter in model.parameters()
                                 if id(parameter) not in new_ids and parameter.requires_grad]
-        inherited_lr = min(a.lr, 2e-5 if reflection_upgrade else 2e-4)
-        groups = [{"params": inherited_parameters, "lr": inherited_lr}]
+        inherited_lr = min(a.lr, 2e-4)
+        groups = []
+        if inherited_parameters:
+            groups.append({"params": inherited_parameters, "lr": inherited_lr})
         if new_point_parameters:
             groups.append({"params": new_point_parameters, "lr": a.lr})
             print(f"Using LR {a.lr:g} for {len(new_point_parameters)} new point-layer tensors; "
-                  f"inherited layers use {inherited_lr:g}")
+                  f"inherited layers use {inherited_lr:g}" if inherited_parameters else
+                  f"Using LR {a.lr:g} for {len(new_point_parameters)} isolated Reflection tensors")
         if reflection_upgrade:
-            print("Reflection-safe upgrade: Mask/Head output layers frozen; "
-                  "teacher consistency protects inherited predictions")
+            print("Reflection-isolated upgrade: the complete inherited Mask+Head network is frozen; "
+                  "only the versioned Reflection refinement branch can change")
         optimizer = torch.optim.AdamW(groups, weight_decay=1e-4)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
@@ -370,18 +372,6 @@ def main():
             if reflection_logits is not None and reflection_valid.any():
                 loss = loss + 0.65 * point_heatmap_loss(
                     reflection_logits, reflection, reflection_valid)
-            if teacher is not None and reflection_output and not base_had_reflection:
-                teacher_x = x
-                if teacher.in_channels == 1:
-                    teacher_x = x[:, teacher_source_channel:teacher_source_channel + 1]
-                with torch.no_grad():
-                    teacher_mask, teacher_head, _ = unpack_outputs(teacher(teacher_x))
-                preservation = F.mse_loss(torch.sigmoid(mask_logits),
-                                          torch.sigmoid(teacher_mask))
-                if head_logits is not None and teacher_head is not None:
-                    preservation = preservation + 0.5 * F.mse_loss(
-                        torch.sigmoid(head_logits), torch.sigmoid(teacher_head))
-                loss = loss + 1.0 * preservation
             optimizer.zero_grad(); loss.backward(); optimizer.step(); losses.append(float(loss.item()))
         val_dice, head_error, reflection_error = evaluate(model, val_loader, device)
         score = validation_score(val_dice, head_error, reflection_error, sample_size)
@@ -398,7 +388,8 @@ def main():
                         "selection_score": score, "in_channels": in_channels,
                         "dual_channel": True, "bg_subtract": True, "bg_gain": BG_GAIN,
                         "head_output": head_output, "reflection_output": reflection_output,
-                        "checkpoint_version": 3,
+                        "reflection_refine": reflection_refine,
+                        "checkpoint_version": 4,
                         "validation": "contiguous_temporal_block"}, candidate_path)
         if epoch - best_epoch >= a.patience:
             print(f"Early stopping at epoch {epoch}; best epoch {best_epoch}")
@@ -469,7 +460,8 @@ def main():
          "candidate_comparable_score": candidate_comparable_score,
          "dice_safe": dice_safe, "head_safe": head_safe,
          "reflection_safe": reflection_safe, "comparable_improved": comparable_improved,
-         "reflection_safe_upgrade": bool(resumed and reflection_output and not base_had_reflection),
+         "reflection_safe_upgrade": bool(resumed and reflection_upgrade),
+         "reflection_refine": reflection_refine,
          "candidate_promoted": promoted,
          "model_output": str(promoted_path.resolve()) if promoted else "",
          "candidate_model": str(candidate_path.resolve()) if not promoted else "",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checkpoint output compatibility tests for U-Net v1/v2/v3."""
+"""Checkpoint output compatibility tests for U-Net v1/v2/v3/v4."""
 import unittest
 
 try:
@@ -34,6 +34,16 @@ class ModelCompatibilityTests(unittest.TestCase):
         mask, head, reflection = unpack_outputs(model(torch.zeros(1, 1, 32, 32)))
         self.assertEqual(tuple(mask.shape), (1, 1, 32, 32))
         self.assertIsNotNone(head); self.assertIsNotNone(reflection)
+
+    def test_v4_refined_reflection_checkpoint(self):
+        source = UNet(head_output=True, reflection_output=True, reflection_refine=True)
+        model = checkpoint_model(self.package(
+            source, head_output=True, reflection_output=True,
+            reflection_refine=True), "cpu")
+        mask, head, reflection = unpack_outputs(model(torch.zeros(1, 1, 32, 32)))
+        self.assertEqual(tuple(mask.shape), (1, 1, 32, 32))
+        self.assertIsNotNone(head); self.assertIsNotNone(reflection)
+        self.assertIsNotNone(model.reflection_refine)
 
 
 if __name__ == "__main__":
