@@ -18,6 +18,34 @@ def simplify(points: np.ndarray, count: int = 8) -> np.ndarray:
     return points[np.linspace(0, len(points) - 1, count, dtype=int)].astype(float)
 
 
+def create_editor_window(title: str, preview: np.ndarray, mouse_callback) -> None:
+    """Create HighGUI eagerly before registering callbacks.
+
+    OpenCV 5's Qt backend on Windows may not allocate the native window until
+    the first imshow/waitKey. Calling setMouseCallback immediately after
+    namedWindow then raises ``NULL window handler``. Try two portable modes and
+    register the callback only after a frame has been presented.
+    """
+    errors = []
+    for mode in (cv2.WINDOW_NORMAL, cv2.WINDOW_AUTOSIZE):
+        try:
+            cv2.namedWindow(title, mode)
+            cv2.imshow(title, preview)
+            cv2.waitKey(50)
+            if mode == cv2.WINDOW_NORMAL:
+                cv2.resizeWindow(title, preview.shape[1], preview.shape[0])
+            cv2.setMouseCallback(title, mouse_callback)
+            return
+        except cv2.error as exc:
+            errors.append(str(exc))
+            try:
+                cv2.destroyWindow(title)
+                cv2.waitKey(1)
+            except cv2.error:
+                pass
+    raise RuntimeError("OpenCV could not create an interactive editor window. " + " | ".join(errors))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", required=True)
@@ -61,7 +89,9 @@ def main() -> None:
                     max(1, int(round(image.shape[0] * scale))))
     state = {"points": points, "drag": None, "last": tuple(points[0]),
              "excluded": excluded, "saved": 0, "message": "ready"}
-    title = f"Edit label · {Path(args.video).name} · frame {args.frame}"
+    # ASCII-only title avoids a second OpenCV 5/Qt handle issue on some
+    # Windows locales; the video/frame identity is also drawn inside the UI.
+    title = f"Polygon label editor - frame {args.frame}"
 
     def nearest(x: float, y: float) -> tuple[int, float]:
         distance = np.linalg.norm(state["points"] - np.asarray([x, y]), axis=1)
@@ -102,8 +132,8 @@ def main() -> None:
             state["points"] = np.delete(points_, index, axis=0)
             save()
 
-    cv2.namedWindow(title, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(title, mouse)
+    first_preview = cv2.resize(image, display_size, interpolation=cv2.INTER_LINEAR)
+    create_editor_window(title, first_preview, mouse)
     while True:
         if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
             save(); break
