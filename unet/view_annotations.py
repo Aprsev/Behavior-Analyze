@@ -89,9 +89,15 @@ class ContactSheet:
         return items
 
     def _load_items(self) -> list[dict]:
-        items = self._dataset_items()
-        self.mode = "训练数据（绿色=mask，红色=head）" if items else "原始多边形标注（绿色=轮廓）"
-        return items or self._raw_items()
+        raw, dataset = self._raw_items(), self._dataset_items()
+        if self.args.source == "dataset":
+            self.mode = "上次重建的训练数据（绿色=mask，红色=head）"
+            return dataset
+        if raw:
+            self.mode = "当前 CSV 原始标注（绿色=轮廓；保存后立即反映）"
+            return raw
+        self.mode = "当前 CSV 无法读取，回退到上次重建的训练数据"
+        return dataset
 
     def _build(self) -> None:
         self.root.title("已标注数据 · 分页拼接预览")
@@ -196,6 +202,7 @@ def main() -> None:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--labels", required=True)
     parser.add_argument("--video", action="append", default=[])
+    parser.add_argument("--source", choices=("csv", "dataset"), default="csv")
     args = parser.parse_args()
     root = tk.Tk()
     try:

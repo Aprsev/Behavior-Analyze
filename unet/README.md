@@ -78,10 +78,10 @@ python unet/run_unet.py ui
 
 # In the GUI, open “使用已有标注训练”. The first, prominent button is
 # “一键重建数据集并训练”; it reuses all saved CSV labels and does not start
-# another annotation round. “拼接查看已标注数据” opens a 5 x 4 contact sheet:
-# green is the training mask, red is an available head heatmap, and the arrow
-# keys change pages. Before the first rebuild it falls back to the saved
-# polygons drawn over the source videos.
+# another annotation round. “拼接查看当前 CSV 标注” opens a 5 x 4 contact
+# sheet directly from the source-of-truth CSV, so a saved correction appears
+# immediately. “查看上次重建样本” separately shows the actual exported mask
+# (green) and available head heatmap (red). Arrow keys change pages.
 
 # 0b. NEW video, first time: click the 4 arena corners to make its ROI JSON
 #     (saved as traditional/basic_rois/{stem}_roi.json), then add the

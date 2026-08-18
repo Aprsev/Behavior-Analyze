@@ -370,8 +370,9 @@ are isolated on an advanced tab. Every video has its own ROI and output path,
 and all long operations run in cancellable child processes.
 
 In **使用已有标注训练**, click **一键重建数据集并训练** to reuse all saved
-annotations. **拼接查看已标注数据** displays 20 overlaid samples per page, with
-arrow-key pagination, instead of reopening labels one frame at a time.
+annotations. **拼接查看当前 CSV 标注** displays 20 current labels per page;
+**查看上次重建样本** separately checks the last exported training masks. Use
+**复查/修正已有轮廓** on the advanced tab to overwrite an incorrect old label.
 
 The legacy classical GUI remains available with:
 

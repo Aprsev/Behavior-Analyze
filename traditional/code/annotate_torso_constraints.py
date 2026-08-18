@@ -11,13 +11,14 @@ candidates; otherwise farthest-point sampling over arena descriptors picks
 the most different frames of the video. Already-labelled frames are skipped.
 
 Controls: drag cyan vertex; click edge to add vertex; Backspace removes nearest
-vertex; R restores automatic contour; E excludes frame; A/D step; J/L +/-10;
+vertex; R restores automatic contour; E toggles exclusion; A/D step; J/L +/-10;
 S save; Q/Esc save and quit.
 """
 from __future__ import annotations
 
 import argparse, json
 from pathlib import Path
+import shutil
 import cv2
 import numpy as np
 import pandas as pd
@@ -29,6 +30,15 @@ from mouse_behavior_pipeline import (
 def simplify(points: np.ndarray, count: int = 8) -> np.ndarray:
     if len(points) <= count: return points.astype(float)
     return points[np.linspace(0, len(points)-1, count, dtype=int)].astype(float)
+
+
+def as_bool(value) -> bool:
+    """Parse bool-like CSV values without treating the string 'False' as true."""
+    if pd.isna(value):
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
 
 
 def scan_candidates(
@@ -123,7 +133,7 @@ def _select_frames(args, labels: dict, cap: cv2.VideoCapture, total: int,
         if not len(cand):
             raise SystemExit(f'No screening rows for {Path(args.input).name}.\n'
                              f'Run screening first: python unet/run_unet.py screen')
-        keep = cand.loc[~cand.exclude.fillna(False).astype(bool)].frame.astype(int)
+        keep = cand.loc[~cand.exclude.map(as_bool)].frame.astype(int)
         frames = [f for f in dict.fromkeys(int(f) for f in keep) if f not in labels]
         print(f'Using {len(frames)} screened candidate frames (junk already removed).')
         return frames[:args.max_labels]
@@ -146,9 +156,27 @@ def merge_labels(path: Path, video_name: str, rows: list[dict]) -> None:
     touched = [r["frame"] for r in rows]
     keep = ~((old.video == video_name) & old.frame.isin(touched))
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.concat([old.loc[keep], pd.DataFrame(rows)], ignore_index=True) \
-        .sort_values(["video", "frame"]).to_csv(path, index=False)
-    print(f"Saved {len(rows)} polygon torso constraints to {path}")
+    merged = pd.concat([old.loc[keep], pd.DataFrame(rows)], ignore_index=True) \
+        .drop_duplicates(["video", "frame"], keep="last") \
+        .sort_values(["video", "frame"])
+    # Write-verify-replace prevents a closed/crashed GUI from leaving a
+    # partially written CSV. Keep the immediately previous version as .bak.
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    backup = path.with_suffix(path.suffix + ".bak")
+    merged.to_csv(temporary, index=False)
+    check = pd.read_csv(temporary)
+    expected = {(video_name, int(row["frame"])) for row in rows}
+    actual = set(zip(check.video.astype(str), check.frame.astype(int)))
+    missing = expected - actual
+    if missing:
+        temporary.unlink(missing_ok=True)
+        raise IOError(f"Save verification failed; {len(missing)} annotations are missing")
+    if path.is_file():
+        shutil.copy2(path, backup)
+    temporary.replace(path)
+    print(f"Saved and verified {len(rows)} polygon torso constraints to {path}")
+    if backup.is_file():
+        print(f"Previous label file backed up as {backup}")
 
 
 def merge_annotation_exclusions(screening_csv: str, video_name: str, label_rows: list[dict]) -> None:
@@ -156,14 +184,13 @@ def merge_annotation_exclusions(screening_csv: str, video_name: str, label_rows:
     so prepare/infer also skip them. Silently skips when no screening CSV."""
     if not screening_csv or not Path(screening_csv).is_file():
         return
-    excluded = {int(row['frame']) for row in label_rows if bool(row.get('exclude'))}
-    if not excluded:
-        return
     path = Path(screening_csv)
     df = pd.read_csv(path)
-    df.loc[(df.video == video_name) & df.frame.isin(excluded), 'exclude'] = 1
+    values = {int(row['frame']): as_bool(row.get('exclude')) for row in label_rows}
+    for frame, excluded in values.items():
+        df.loc[(df.video == video_name) & (df.frame == frame), 'exclude'] = int(excluded)
     df.to_csv(path, index=False)
-    print(f'Recorded {len(excluded)} annotation exclusions in {screening_csv}')
+    print(f'Synchronized exclusion state for {len(values)} annotations in {screening_csv}')
 
 
 def main() -> None:
@@ -172,6 +199,8 @@ def main() -> None:
     p.add_argument('--roi-json',required=True); p.add_argument('--output',required=True)
     p.add_argument('--arena-width-cm',type=float,required=True); p.add_argument('--arena-height-cm',type=float,required=True)
     p.add_argument('--max-labels',type=int,default=50); p.add_argument('--candidate-csv',default='')
+    p.add_argument('--review-existing', action='store_true',
+                   help='review and overwrite existing labels for this video instead of selecting new frames')
     args=p.parse_args()
     data=pd.read_csv(args.comparison_csv)
     old=pd.read_csv(args.output) if Path(args.output).exists() else pd.DataFrame(columns=['frame','polygon_px','exclude'])
@@ -188,13 +217,21 @@ def main() -> None:
     background=np.percentile(rect_samples,85,axis=0).astype(np.uint8)
     threshold,_=robust_threshold(rect_samples,background,0)
     cap=cv2.VideoCapture(args.input); title='Polygon torso correction (cyan); remove fibre/tail'
-    frames=_select_frames(args,labels,cap,total,forward,rw,rh,background,threshold)
+    if args.review_existing:
+        frames = sorted(frame for frame, row in labels.items()
+                        if isinstance(row.get('polygon_px'), str) and row.get('polygon_px'))
+        if args.max_labels > 0:
+            frames = frames[:args.max_labels]
+        print(f'Review mode: loaded {len(frames)} existing labels for {Path(args.input).name}.')
+    else:
+        frames=_select_frames(args,labels,cap,total,forward,rw,rh,background,threshold)
     if not frames:
-        print('No new frames to label: all screened candidates are already labelled.')
+        print('No existing labels to review.' if args.review_existing else
+              'No new frames to label: all screened candidates are already labelled.')
         cap.release(); return
-    print(f'{Path(args.input).name}: {len(labels)} frames already labelled, '
-          f'{len(frames)} NEW unlabelled frames to label (max {args.max_labels} per run) - '
-          f'previously labelled frames are never shown again.')
+    if not args.review_existing:
+        print(f'{Path(args.input).name}: {len(labels)} frames already labelled, '
+              f'{len(frames)} NEW unlabelled frames to label (max {args.max_labels} per run).')
     state={'i':0,'points':None,'drag':None}
     def frame_image(frame):
         cap.set(cv2.CAP_PROP_POS_FRAMES,frame); ok,img=cap.read()
@@ -228,7 +265,7 @@ def main() -> None:
         """Keep the current editable polygon in memory before any navigation."""
         frame = frames[state['i']]
         previous = labels.get(frame)
-        excluded = bool(previous.exclude) if previous is not None else False
+        excluded = as_bool(previous.exclude) if previous is not None else False
         labels[frame] = pd.Series({
             'frame': frame,
             'polygon_px': json.dumps(np.asarray(state['points']).round(1).tolist()),
@@ -253,7 +290,7 @@ def main() -> None:
     def save():
         commit_current()
         rows=[]
-        for frame,row in labels.items(): rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':bool(row.exclude),'video':Path(args.input).name})
+        for frame,row in labels.items(): rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':as_bool(row.exclude),'video':Path(args.input).name})
         # Merge into the shared CSV: this session only replaces its own
         # (video, frame) rows; every other video's annotations are kept.
         merge_labels(Path(args.output), Path(args.input).name, rows)
@@ -270,7 +307,7 @@ def main() -> None:
         cv2.polylines(img,[pts],True,(255,255,0),2,cv2.LINE_AA)
         for x,y in pts: cv2.circle(img,(x,y),4,(255,255,0),-1,cv2.LINE_AA)
         cv2.rectangle(img,(0,0),(img.shape[1],47),(0,0,0),-1)
-        excluded_flag = bool(labels.get(frame) is not None and bool(labels[frame].exclude))
+        excluded_flag = bool(labels.get(frame) is not None and as_bool(labels[frame].exclude))
         status = ' [EXCLUDED]' if excluded_flag else ''
         cv2.putText(img,f'{state["i"]+1}/{len(frames)} frame={frame}{status}: automatic body contour; adjust only fibre/tail-affected vertices',(8,19),cv2.FONT_HERSHEY_SIMPLEX,.43,(0,0,255) if excluded_flag else (255,255,255),1)
         cv2.putText(img,'Drag vertex / click edge add  Backspace delete  R recalc  T thin(8pts)  E discard  A/D step  S save  Q quit',(8,39),cv2.FONT_HERSHEY_SIMPLEX,.37,(255,255,255),1)
@@ -285,10 +322,11 @@ def main() -> None:
         elif k in (8,127) and len(state['points'])>3:
             idx,_=nearest(*state['points'].mean(axis=0)); state['points']=np.delete(state['points'],idx,axis=0)
         elif k in (ord('e'),ord('E')):
-            # Discard the current frame: mark excluded and move to the next one.
+            # Toggle exclusion so an accidentally discarded old label can be restored.
             commit_current()
-            labels[frame] = pd.Series({'frame':frame,'polygon_px':json.dumps(np.asarray(state['points']).round(1).tolist()),'exclude':True})
-            print(f'Discarded frame {frame} (excluded from training)')
+            excluded = not as_bool(labels[frame].exclude)
+            labels[frame] = pd.Series({'frame':frame,'polygon_px':json.dumps(np.asarray(state['points']).round(1).tolist()),'exclude':excluded})
+            print(f'Frame {frame}: exclude={excluded}')
             state['i'] = min(len(frames)-1, state['i']+1); load()
         elif k in (81,ord('a')): commit_current(); state['i']=max(0,state['i']-1); load()
         elif k in (83,ord('d')): commit_current(); state['i']=min(len(frames)-1,state['i']+1); load()

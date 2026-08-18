@@ -306,6 +306,12 @@ class App:
             if not (cfg["compare_out"] / "head_method_comparison.csv").is_file():
                 messagebox.showerror("缺少对比数据", "请先运行“生成传统对比数据”。"); return
             commands = [R.annotate_cmd(cfg, w, h, self.args)]
+        elif key == "review":
+            if not self.args.labels.is_file():
+                messagebox.showerror("缺少标注", "尚未找到已有多边形标注 CSV。"); return
+            if not (cfg["compare_out"] / "head_method_comparison.csv").is_file():
+                messagebox.showerror("缺少对比数据", "请先运行“生成传统对比数据”。"); return
+            commands = [R.annotate_cmd(cfg, w, h, self.args, review_existing=True)]
         elif key == "calibrate":
             if not self.args.model.is_file():
                 messagebox.showerror("缺少模型", "请先训练模型。"); return
@@ -329,7 +335,7 @@ class App:
             lines.append(f"{name}\n  torso mask: {torso}    head/reflection: {head}")
         messagebox.showinfo("现有标注统计", "\n\n".join(lines) if lines else "没有标注记录")
 
-    def view_annotations(self) -> None:
+    def view_annotations(self, source: str = "csv") -> None:
         """Open the paginated contact sheet without blocking this GUI."""
         if not self._sync_args():
             return
@@ -338,7 +344,8 @@ class App:
             messagebox.showerror("没有标注", "未找到训练数据集，也未找到多边形标注 CSV。")
             return
         argv = [sys.executable, str(Path(__file__).with_name("view_annotations.py")),
-                "--dataset", str(self.args.dataset), "--labels", str(self.args.labels)]
+                "--dataset", str(self.args.dataset), "--labels", str(self.args.labels),
+                "--source", source]
         for video in videos:
             argv.extend(["--video", str(video)])
         try:
@@ -623,7 +630,7 @@ class App:
         quick_actions = ttk.Frame(quick_train); quick_actions.pack(fill="x", padx=10, pady=(0, 10))
         self._button(quick_actions, "一键重建数据集并训练", lambda: self.rebuild_dataset(True),
                      style="Primary.TButton", width=24).pack(side="left")
-        self._button(quick_actions, "拼接查看已标注数据", self.view_annotations,
+        self._button(quick_actions, "拼接查看当前 CSV 标注", lambda: self.view_annotations("csv"),
                      width=22).pack(side="left", padx=8)
         ttk.Label(quick_actions, text="每页 20 张；←/→ 翻页", font=SMALL,
                   foreground="#666").pack(side="left", padx=4)
@@ -642,7 +649,7 @@ class App:
         train_actions = ttk.Frame(train_tab); train_actions.pack(fill="x", padx=8, pady=4)
         self._button(train_actions, "仅重建数据集", self.rebuild_dataset, width=15).pack(side="left")
         self._button(train_actions, "仅训练", self.train, width=12).pack(side="left", padx=6)
-        self._button(train_actions, "拼接查看训练样本", self.view_annotations, width=18).pack(side="left")
+        self._button(train_actions, "查看上次重建样本", lambda: self.view_annotations("dataset"), width=18).pack(side="left")
         ttk.Label(train_tab, textvariable=self.training_summary_var, font=FONT, foreground="#176b3a").pack(anchor="w", padx=12, pady=5)
         self.curve = tk.Canvas(train_tab, height=145, bg="#fafbfc", highlightthickness=1,
                                highlightbackground="#ccd3da"); self.curve.pack(fill="x", padx=8, pady=5)
@@ -656,6 +663,7 @@ class App:
         self._button(advanced, "生成传统对比数据", lambda: self.advanced_step("compare")).pack(side="left", padx=3)
         self._button(advanced, "筛选新帧", lambda: self.advanced_step("screen")).pack(side="left", padx=3)
         self._button(advanced, "补充多边形标注", lambda: self.advanced_step("annotate")).pack(side="left", padx=3)
+        self._button(advanced, "复查/修正已有轮廓", lambda: self.advanced_step("review")).pack(side="left", padx=3)
         self._button(advanced, "校准并重训", lambda: self.advanced_step("calibrate")).pack(side="left", padx=3)
         self._button(advanced, "查看标注统计", self.show_annotation_stats).pack(side="left", padx=3)
         ttk.Label(annotation_tab, text="每视频最多新增帧数", font=FONT).pack(anchor="w", padx=12, pady=(10, 2))

@@ -135,13 +135,17 @@ def screen_cmd(cfg: dict, w: str, h: str, a) -> tuple[Path, list[str]]:
         "--arena-width-cm", w, "--arena-height-cm", h]
 
 
-def annotate_cmd(cfg: dict, w: str, h: str, a) -> tuple[Path, list[str]]:
-    return CODE / "annotate_torso_constraints.py", [
+def annotate_cmd(cfg: dict, w: str, h: str, a, review_existing: bool = False) -> tuple[Path, list[str]]:
+    argv = [
         "--input", str(cfg["video"]),
         "--comparison-csv", str(cfg["compare_out"] / "head_method_comparison.csv"),
         "--roi-json", str(cfg["roi"]), "--output", str(a.labels),
         "--arena-width-cm", w, "--arena-height-cm", h,
-        "--max-labels", str(a.max_labels), "--candidate-csv", str(a.screening)]
+        "--max-labels", "0" if review_existing else str(a.max_labels),
+        "--candidate-csv", str(a.screening)]
+    if review_existing:
+        argv.append("--review-existing")
+    return CODE / "annotate_torso_constraints.py", argv
 
 
 def prepare_cmd(cfg: dict, w: str, h: str, a) -> tuple[Path, list[str]]:
