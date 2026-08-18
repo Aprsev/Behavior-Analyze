@@ -187,7 +187,13 @@ class ContactSheet:
         contours, _ = cv2.findContours((mask > 127).astype(np.uint8), cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(image, contours, -1, (0, 255, 80), 2)
-        head = cv2.imread(str(self.dataset / "heads" / name), cv2.IMREAD_GRAYSCALE)
+        # Legacy torso-only samples legitimately have no head heatmap.  Do not
+        # call imread for an absent file: OpenCV 5 prints one warning per
+        # thumbnail, which looks like a data failure even though the sample is
+        # still valid for mask training.
+        head_path = self.dataset / "heads" / name
+        head = (cv2.imread(str(head_path), cv2.IMREAD_GRAYSCALE)
+                if head_path.is_file() else None)
         if head is not None and head.max() > 0:
             _, _, _, point = cv2.minMaxLoc(head)
             cv2.circle(image, point, 6, (255, 30, 30), -1, cv2.LINE_AA)

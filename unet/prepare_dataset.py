@@ -29,6 +29,14 @@ def gaussian_heatmap(size: int, x: float, y: float, sigma: float = 4.0) -> np.nd
     heat = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2.0 * sigma ** 2))
     return np.clip(heat * 255.0, 0, 255).astype(np.uint8)
 
+
+def has_head_heatmap(path: Path) -> bool:
+    """Return False for an absent/corrupt/empty optional head target."""
+    if not path.is_file():
+        return False
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    return image is not None and bool(image.max() > 0)
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--video', required=True); p.add_argument('--labels', required=True)
@@ -149,7 +157,7 @@ def main():
                 'label_excluded_frames': sorted(label_excluded),
                 'screening_excluded_frames': sorted(screening_excluded),
                 'excluded_frames': sorted(excluded),
-                'head_count': int(sum(cv2.imread(str(head_dir / name), 0).max() > 0 for name in wanted)),
+                'head_count': int(sum(has_head_heatmap(head_dir / name) for name in wanted)),
                 'background': str(bg_path) if bg is not None else ''}
     if (out / 'dataset.json').exists():
         old = json.loads((out / 'dataset.json').read_text(encoding='utf-8'))

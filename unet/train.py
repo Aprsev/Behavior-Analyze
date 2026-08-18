@@ -68,6 +68,14 @@ def load_backgrounds(root: Path, files: list[str]) -> dict[str, np.ndarray]:
     return result
 
 
+def has_head_heatmap(path: Path) -> bool:
+    """Optional head targets may be absent in legacy torso-only datasets."""
+    if not path.is_file():
+        return False
+    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    return image is not None and bool(image.max() > 0)
+
+
 def temporal_split(files: list[str], fraction: float = 0.2) -> tuple[list[str], list[str]]:
     """Hold out one contiguous time block per video instead of adjacent leakage."""
     groups: dict[str, list[str]] = {}
@@ -186,8 +194,7 @@ def main():
                          "mixed raw/residual training is forbidden.")
     in_channels = 2
     sample_size = int(cv2.imread(str(root / "images" / files[0]), 0).shape[0])
-    head_output = any((root / "heads" / f).is_file() and
-                      cv2.imread(str(root / "heads" / f), 0).max() > 0 for f in files)
+    head_output = any(has_head_heatmap(root / "heads" / f) for f in files)
     train_files, val_files = temporal_split(files)
     if not train_files or not val_files:
         raise ValueError("Training/validation split is empty")
