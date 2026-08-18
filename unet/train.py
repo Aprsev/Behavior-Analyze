@@ -207,9 +207,9 @@ def validation_score(dice: float, head_error, reflection_error, size: int) -> fl
     """Prefer accurate masks while breaking close Dice ties with keypoints."""
     penalty = 0.0
     if head_error is not None:
-        penalty += 0.10 * float(head_error) / size
+        penalty += 0.15 * float(head_error) / size
     if reflection_error is not None:
-        penalty += 0.08 * float(reflection_error) / size
+        penalty += 0.25 * float(reflection_error) / size
     return float(dice - penalty)
 
 
@@ -236,6 +236,11 @@ def main():
     p.add_argument("--base-model", default="", help="optional old/new checkpoint used only for warm start")
     p.add_argument("--patience", type=int, default=18)
     a = p.parse_args()
+    requested_lr = float(a.lr)
+    a.lr = min(max(requested_lr, 1e-6), 3e-3)
+    if a.lr != requested_lr:
+        print(f"WARNING: requested learning rate {requested_lr:g} is unsafe for keypoint "
+              f"training; clamped to {a.lr:g}")
     random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(a.seed)
@@ -348,7 +353,10 @@ def main():
         if epoch - best_epoch >= a.patience:
             print(f"Early stopping at epoch {epoch}; best epoch {best_epoch}")
             break
-    promoted = (not resumed or
+    head_ready = not head_output or (best_head_error is not None and best_head_error <= 18.0)
+    reflection_ready = (not reflection_output or
+                        (best_reflection_error is not None and best_reflection_error <= 18.0))
+    promoted = head_ready and reflection_ready and (not resumed or
                 (best_score >= baseline_score if base_had_reflection
                  else best >= baseline_dice - 0.01))
     if promoted:
@@ -358,7 +366,15 @@ def main():
         print(f"Promoted reflection candidate: Dice {best:.5f}; score {best_score:.5f}")
         print(f"MODEL_OUTPUT={promoted_path.resolve()}")
     else:
-        print(f"Kept selected source model unchanged; candidate retained at {candidate_path}")
+        reasons = []
+        if not head_ready:
+            reasons.append(f"Head error {best_head_error} > 18 px")
+        if not reflection_ready:
+            reasons.append(f"Reflection error {best_reflection_error} > 18 px")
+        if not reasons:
+            reasons.append("combined validation score did not improve")
+        print(f"Kept selected source model unchanged ({'; '.join(reasons)}); "
+              f"candidate retained at {candidate_path}")
     (out / "training_history.json").write_text(json.dumps(
         {"device": device, "train_count": len(train_files), "val_count": len(val_files),
          "best_val_dice": best, "best_epoch": best_epoch, "warm_started": resumed,
@@ -372,6 +388,8 @@ def main():
          "model_output": str(promoted_path.resolve()) if promoted else "",
          "candidate_model": str(candidate_path.resolve()) if not promoted else "",
          "base_model": str(base_path.resolve()) if base_path.is_file() else "",
+         "requested_lr": requested_lr, "effective_lr": a.lr,
+         "head_ready": head_ready, "reflection_ready": reflection_ready,
          "in_channels": in_channels, "head_output": head_output,
          "reflection_output": reflection_output,
          "head_train_labels": sum(has_head_heatmap(root / "heads" / f) for f in train_files),

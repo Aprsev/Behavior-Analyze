@@ -177,7 +177,10 @@ class App:
             self.args.rotate = int(self.rotate_var.get())
             self.args.epochs = max(1, int(self.epochs_var.get()))
             self.args.batch_size = max(1, int(self.batch_var.get()))
-            self.args.lr = max(1e-6, float(self.lr_var.get()))
+            requested_lr = float(self.lr_var.get())
+            self.args.lr = min(3e-3, max(1e-6, requested_lr))
+            if requested_lr != self.args.lr:
+                self.lr_var.set(f"{self.args.lr:g}")
             self.args.per_video = max(1, int(self.per_video_var.get()))
             self.args.max_labels = self.args.per_video
             self.cfg()["output"] = self.args.infer_out
