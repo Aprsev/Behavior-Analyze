@@ -334,14 +334,15 @@ def main():
         inherited_parameters = [parameter for parameter in model.parameters()
                                 if id(parameter) not in new_ids and parameter.requires_grad]
         inherited_lr = min(a.lr, 2e-4)
+        point_lr = min(a.lr, 5e-4) if reflection_upgrade else a.lr
         groups = []
         if inherited_parameters:
             groups.append({"params": inherited_parameters, "lr": inherited_lr})
         if new_point_parameters:
-            groups.append({"params": new_point_parameters, "lr": a.lr})
-            print(f"Using LR {a.lr:g} for {len(new_point_parameters)} new point-layer tensors; "
+            groups.append({"params": new_point_parameters, "lr": point_lr})
+            print(f"Using LR {point_lr:g} for {len(new_point_parameters)} new point-layer tensors; "
                   f"inherited layers use {inherited_lr:g}" if inherited_parameters else
-                  f"Using LR {a.lr:g} for {len(new_point_parameters)} isolated Reflection tensors")
+                  f"Using LR {point_lr:g} for {len(new_point_parameters)} isolated Reflection tensors")
         if reflection_upgrade:
             print("Reflection-isolated upgrade: the complete inherited Mask+Head network is frozen; "
                   "only the versioned Reflection refinement branch can change")
@@ -352,7 +353,7 @@ def main():
     best = -1.0; best_score = -1e9; best_epoch = 0; best_head_error = None
     best_reflection_error = None; history = []
     for epoch in range(1, a.epochs + 1):
-        model.train(); losses = []
+        model.train(); losses = []; skipped_unlabelled_batches = 0
         if resumed and reflection_output and not base_had_reflection:
             # Updating BatchNorm running statistics alone can damage the old
             # model even at a tiny learning rate.
@@ -363,6 +364,12 @@ def main():
             x, mask = x.to(device), mask.to(device)
             head, valid = head.to(device), valid.to(device)
             reflection, reflection_valid = reflection.to(device), reflection_valid.to(device)
+            # In an isolated upgrade the only trainable branch is Reflection.
+            # A batch with no Reflection truth has intentionally no supervised
+            # gradient; skip it instead of calling backward on a constant loss.
+            if reflection_upgrade and not bool(reflection_valid.any().item()):
+                skipped_unlabelled_batches += 1
+                continue
             output = model(x)
             mask_logits, head_logits, reflection_logits = unpack_outputs(output)
             loss = (bce(mask_logits, mask) + (1.0 - soft_dice(mask_logits, mask)) +
@@ -377,7 +384,8 @@ def main():
         score = validation_score(val_dice, head_error, reflection_error, sample_size)
         row = {"epoch": epoch, "train_loss": float(np.mean(losses)), "val_dice": val_dice,
                "head_error_px": head_error, "reflection_error_px": reflection_error,
-               "selection_score": score}
+               "selection_score": score,
+               "skipped_unlabelled_batches": skipped_unlabelled_batches}
         history.append(row); print(json.dumps(row), flush=True)
         if score > best_score:
             best, best_score, best_epoch = val_dice, score, epoch

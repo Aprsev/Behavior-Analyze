@@ -265,7 +265,9 @@ the source model rather than being softly encouraged to stay close. Reflection
 heatmaps also receive an explicit coordinate loss so that a plausible blob on
 the fibre or tail is penalized. Checkpoint v4 records this branch explicitly;
 v1 mask-only, v2 Mask+Head, and v3 single-layer Reflection files remain directly
-loadable.
+loadable. Reflection-only training caps the branch learning rate at `5e-4` and
+skips batches without Reflection truth; missing labels are unknown, not negative
+examples, and no backward pass is attempted on a fully frozen batch.
 
 Promotion is regression-gated. A candidate is selected automatically only if
 its comparable Mask+Head score is at least the baseline score, Dice drops by no
