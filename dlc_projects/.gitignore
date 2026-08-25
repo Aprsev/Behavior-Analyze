@@ -1,0 +1,3 @@
+# DeepLabCut projects contain extracted images, labels, and model snapshots.
+*
+!.gitignore

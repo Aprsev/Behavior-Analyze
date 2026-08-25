@@ -1,0 +1,5 @@
+# Per-computer Hybrid Workbench state and optional local weights
+hybrid_config.json
+*.pt
+*.pb
+__pycache__/

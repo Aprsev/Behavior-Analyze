@@ -1,0 +1,139 @@
+{
+  "videos": [
+    "../data/12026-08-12 160535.avi"
+  ],
+  "video": "../data/12026-08-12 160535.avi",
+  "roi_json": "../traditional/basic_rois/160535_roi.json",
+  "output_dir": "../results/hybrid_dlc",
+  "working_directory": "../dlc_projects",
+  "project_config": "",
+  "arena_width_cm": 25.0,
+  "arena_height_cm": 30.0,
+  "yolo": {
+    "dataset_dir": "../yolo_datasets/mouse",
+    "samples_per_video": 80,
+    "background_samples": 61,
+    "background_percentile": 85.0,
+    "background_threshold": 0.0,
+    "auto_box_padding": 0.15,
+    "validation_fraction": 0.2,
+    "split_seed": 42,
+    "base_model": "yolo26n.pt",
+    "trained_model": "",
+    "run_name": "mouse_detector",
+    "device": "auto",
+    "epochs": 100,
+    "image_size": 640,
+    "batch_size": 8,
+    "workers": 4,
+    "patience": 30,
+    "confidence": 0.25,
+    "iou": 0.7,
+    "crop_scale": 1.5,
+    "max_fallback_sec": 0.3
+  },
+  "super_resolution": {
+    "method": "edsr",
+    "model_path": "",
+    "scale": 4,
+    "output_size": 512
+  },
+  "model": {
+    "superanimal_name": "superanimal_topviewmouse",
+    "model_name": "hrnet_w32",
+    "detector_name": "fasterrcnn_resnet50_fpn_v2",
+    "device": "auto",
+    "batch_size": 4,
+    "detector_batch_size": 1,
+    "inference_pcutoff": 0.1,
+    "video_adapt": true,
+    "video_adapt_batch_size": 4,
+    "pseudo_threshold": 0.1,
+    "bbox_threshold": 0.9,
+    "detector_epochs": 1,
+    "pose_epochs": 1
+  },
+  "postprocess": {
+    "pcutoff": 0.35,
+    "max_gap_sec": 0.2,
+    "median_window": 3,
+    "write_overlay": true,
+    "draw_all_keypoints": true
+  },
+  "project": {
+    "task": "mouse_occlusion",
+    "experimenter": "researcher",
+    "copy_videos": false,
+    "training_fraction": 0.9,
+    "num_frames": 40,
+    "bodyparts": [
+      "nose", "left_ear", "right_ear", "left_ear_tip", "right_ear_tip",
+      "left_eye", "right_eye", "neck", "mid_back", "mouse_center",
+      "mid_backend", "mid_backend2", "mid_backend3", "tail_base", "tail1",
+      "tail2", "tail3", "tail4", "tail5", "left_shoulder", "left_midside",
+      "left_hip", "right_shoulder", "right_midside", "right_hip", "tail_end",
+      "head_midpoint"
+    ]
+  },
+  "dataset": {
+    "mode": "automatic",
+    "algorithm": "kmeans",
+    "crop": false,
+    "cluster_step": 1,
+    "cluster_resize_width": 30,
+    "cluster_color": false
+  },
+  "training": {
+    "shuffle": 1,
+    "device": "auto",
+    "epochs": 100,
+    "batch_size": 8,
+    "save_epochs": 10,
+    "detector_epochs": 0,
+    "detector_batch_size": 2,
+    "display_iters": 20,
+    "max_snapshots": 5,
+    "evaluation_plots": true
+  },
+  "inference": {
+    "device": "auto",
+    "batch_size": 4,
+    "detector_batch_size": 1,
+    "pcutoff": 0.35,
+    "save_as_csv": true,
+    "overwrite": false,
+    "use_filtered": false,
+    "draw_skeleton": true,
+    "plot_bboxes": true,
+    "trailpoints": 0
+  },
+  "tuning": {
+    "outlier_algorithm": "jump",
+    "epsilon": 20.0,
+    "p_bound": 0.1,
+    "extraction_algorithm": "kmeans",
+    "automatic": true
+  },
+  "advanced": {
+    "train_yolo": {},
+    "validate_yolo": {},
+    "hybrid_dlc": {},
+    "create_project": {},
+    "add_videos": {},
+    "extract_frames": {},
+    "label_frames": {},
+    "check_labels": {},
+    "build_dataset": {},
+    "train": {
+      "pytorch_cfg_updates": {}
+    },
+    "evaluate": {},
+    "analyze": {},
+    "filter_predictions": {},
+    "labeled_video": {},
+    "plot_trajectories": {},
+    "extract_outliers": {},
+    "refine_labels": {},
+    "merge_datasets": {}
+  }
+}

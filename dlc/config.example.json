@@ -1,0 +1,27 @@
+{
+  "video": "../data/12026-08-12 160535.avi",
+  "roi_json": "../traditional/basic_rois/160535_roi.json",
+  "output_dir": "../results/160535_dlc",
+  "arena_width_cm": 25.0,
+  "arena_height_cm": 30.0,
+  "model": {
+    "superanimal_name": "superanimal_topviewmouse",
+    "model_name": "hrnet_w32",
+    "detector_name": "fasterrcnn_resnet50_fpn_v2",
+    "max_individuals": 1,
+    "batch_size": 4,
+    "detector_batch_size": 1,
+    "video_adapt": true,
+    "pseudo_threshold": 0.1,
+    "bbox_threshold": 0.9,
+    "detector_epochs": 1,
+    "pose_epochs": 1
+  },
+  "postprocess": {
+    "pcutoff": 0.35,
+    "max_gap_sec": 0.2,
+    "median_window": 3,
+    "write_overlay": true,
+    "draw_all_keypoints": true
+  }
+}

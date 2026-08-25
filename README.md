@@ -2,10 +2,12 @@
 
 `Behavior Analyze` is an automated computer-vision pipeline for tracking one mouse in a static-camera rectangular open-field arena. It detects the arena, removes perspective distortion, constructs a static background model, segments the mouse, estimates body-centroid and head positions, converts positions to centimetres, and writes both numerical trajectories and an annotated video. Explicit input paths support MP4, AVI, MOV, MKV, M4V, and WMV files.
 
-The repository now contains two independent paths: `traditional/` keeps the
-classical OpenCV implementation, while `unet/` is the GPU-oriented,
-fibre-aware segmentation and learned-head pipeline recommended for recordings
-with a tethered miniscope.
+The repository now contains three independent paths: `traditional/` keeps the
+classical OpenCV implementation, `unet/` is the GPU-oriented fibre-aware
+segmentation and learned-head pipeline recommended for recordings with a
+tethered miniscope, and `dlc/` uses the pretrained DeepLabCut
+SuperAnimal-TopViewMouse model for multi-keypoint tracking under partial
+occlusion. See [`dlc/README.md`](dlc/README.md) for the remote-GPU workflow.
 
 ## Scope and assumptions
 

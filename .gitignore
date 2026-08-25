@@ -21,3 +21,7 @@ median_background.png
 # GUI state
 unet/.ui_videos.json
 unet/.ui_state.json
+
+# Per-machine DeepLabCut paths and downloaded/generated artifacts
+dlc/config.json
+dlc/modelzoo/
