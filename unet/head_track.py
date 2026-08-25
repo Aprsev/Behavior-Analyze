@@ -293,14 +293,12 @@ def main() -> None:
                         ry = pd.to_numeric(manual.get("reflection_y_cm"), errors="coerce")
                         hx = pd.to_numeric(manual.get("head_x_cm"), errors="coerce")
                         hy = pd.to_numeric(manual.get("head_y_cm"), errors="coerce")
-                        head_verified_value = manual.get("head_verified", np.nan)
-                        head_trusted = (True if pd.isna(head_verified_value)
-                                        else as_bool(head_verified_value))
+                        # Legacy rows without explicit verification are useful
+                        # for audit/retraining migration, but must never bypass
+                        # current anatomical inference as exact frame truth.
+                        head_trusted = as_bool(manual.get("head_verified", False))
                         reflection_verified = as_bool(manual.get("reflection_verified", False))
-                        legacy_consistent = (head_trusted and np.isfinite([rx, ry, hx, hy]).all() and
-                                             np.hypot(float(rx) - float(hx),
-                                                      float(ry) - float(hy)) <= 3.0)
-                        reflection_trusted = reflection_verified or legacy_consistent
+                        reflection_trusted = reflection_verified
                         if reflection_trusted and as_bool(manual.get("reflection_present", True)):
                             if np.isfinite([rx, ry]).all():
                                 reflection = (float(rx) / a.arena_width_cm * (rw - 1),
@@ -308,8 +306,7 @@ def main() -> None:
                                 tracker.position = np.asarray(reflection, np.float32)
                                 tracker.relative = tracker.position - np.asarray(body, np.float32)
                                 reflection_conf = 1.0
-                                reflection_source = ("manual_reflection" if reflection_verified
-                                                     else "legacy_consistent_reflection")
+                                reflection_source = "manual_reflection"
                         elif reflection_verified:
                             reflection = None; reflection_conf = 0.0
                             reflection_source = "manual_reflection_absent"
@@ -317,7 +314,11 @@ def main() -> None:
                             if np.isfinite([hx, hy]).all():
                                 head = (float(hx) / a.arena_width_cm * (rw - 1),
                                         float(hy) / a.arena_height_cm * (rh - 1))
-                                conf = 1.0; head_source = "manual_override"
+                                manual_choice = clamp_choice_to_mask(
+                                    HeadChoice(head, 1.0, "manual_override", None), body_mask)
+                                head, conf, head_source = (manual_choice.point,
+                                                           manual_choice.confidence,
+                                                           manual_choice.source)
                         elif head_trusted:
                             manual_head_absent = True
                             head = None; conf = 0.0; head_source = "manual_head_absent"
@@ -386,6 +387,9 @@ def main() -> None:
                                 cv2.FONT_HERSHEY_SIMPLEX, .43,
                                 (0, 220, 255) if anatomy_corrected else (255, 255, 255),
                                 1, cv2.LINE_AA)
+                cv2.putText(overlay, f"H {head_source}", (12, 68),
+                            cv2.FONT_HERSHEY_SIMPLEX, .40, (0, 220, 255),
+                            1, cv2.LINE_AA)
         overlay_write = np.rot90(overlay, -k) if k else overlay
         if mask_src is None:
             mask_write = np.zeros((h, w), np.uint8)

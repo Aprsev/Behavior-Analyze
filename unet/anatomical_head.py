@@ -172,22 +172,42 @@ class AnatomicalHeadConstraint:
             directions.append(direction / max(
                 math.hypot(float(direction[0]), float(direction[1])), 1e-6))
 
-        if tail_index is not None:
-            head_index = 1 - tail_index
+        candidate_index = None
+        reflection_direction_cue = False
+        if candidate is not None:
+            candidate_index = int(np.argmin([
+                math.hypot(float(candidate[0] - point[0]), float(candidate[1] - point[1]))
+                for point in endpoints]))
+            candidate_axial_distance = abs(float(np.dot(
+                candidate - b, directions[candidate_index])))
+            reflection_direction_cue = (
+                "reflection" in choice.source and outside_distance <= 3.0 and
+                candidate_axial_distance >= 0.12 * major_length)
+
+        tail_head_index = 1 - tail_index if tail_index is not None else None
+        reflection_tail_consensus = (tail_head_index is not None and
+                                     reflection_direction_cue and
+                                     candidate_index == tail_head_index)
+        if tail_head_index is not None:
+            # A contained tail disagrees with a Reflection on the same side:
+            # treat that spot as a tail/fibre false positive.
+            head_index = tail_head_index
+        elif reflection_direction_cue:
+            head_index = candidate_index
         elif self.previous_direction is not None:
             head_index = int(np.argmax([float(np.dot(direction, self.previous_direction))
                                         for direction in directions]))
-        elif candidate is not None:
-            head_index = int(np.argmin([
-                math.hypot(float(candidate[0] - point[0]), float(candidate[1] - point[1]))
-                for point in endpoints]))
+        elif candidate_index is not None:
+            head_index = candidate_index
         else:
             return AnatomyResult(choice, elongation, False, corrected, outside_distance)
 
         proposed_direction = directions[head_index]
         if self.previous_direction is not None and np.dot(proposed_direction, self.previous_direction) < 0:
             self.flip_votes += 1
-            if self.flip_votes < self.flip_confirm_frames:
+            required_votes = (1 if reflection_tail_consensus else
+                              2 if reflection_direction_cue else self.flip_confirm_frames)
+            if self.flip_votes < required_votes:
                 head_index = int(np.argmax([float(np.dot(direction, self.previous_direction))
                                             for direction in directions]))
                 proposed_direction = directions[head_index]

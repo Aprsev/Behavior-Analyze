@@ -43,6 +43,18 @@ class AnatomicalHeadTests(unittest.TestCase):
         tail = tracker.tail_endpoint(mask, foreground, geometry[2])
         self.assertIsNone(tail)
 
+    def test_repeated_reflection_corrects_stale_endpoint(self):
+        mask = self.elongated_mask()
+        tracker = AnatomicalHeadConstraint()
+        tracker.update((90, 60), mask, mask,
+                       HeadChoice((132, 60), .8, "reflection", None))
+        first = tracker.update((90, 60), mask, mask,
+                               HeadChoice((48, 60), .8, "reflection", None))
+        second = tracker.update((90, 60), mask, mask,
+                                HeadChoice((48, 60), .8, "reflection", None))
+        self.assertGreater(first.choice.point[0], 90)
+        self.assertLess(second.choice.point[0], 90)
+
 
 if __name__ == "__main__":
     unittest.main()

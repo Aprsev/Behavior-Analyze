@@ -290,6 +290,12 @@ reaching the rectified FOV boundary is treated as fibre, while a contained thin
 branch supplies a tail-side cue and selects the opposite endpoint as Head. The
 trajectory CSV reports `head_anatomy_corrected`, `body_elongation`,
 `tail_hint_detected`, and `head_outside_distance_px` for auditing.
+Only CSV rows with explicit `head_verified=true` or
+`reflection_verified=true` may override inference. Legacy rows with a missing
+verification field remain available for dataset migration but cannot bypass
+mask/anatomy constraints. The overlay prints `H <source>` so manual overrides,
+Reflection choices, anatomical endpoint corrections, and temporal fills are
+visibly distinguishable.
 
 ### Coordinate calibration & wall-band exclusion
 
