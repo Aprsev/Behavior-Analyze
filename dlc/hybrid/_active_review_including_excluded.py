@@ -1,4 +1,4 @@
-"""Sequential active-learning review that omits excluded frames."""
+"""Sequential low-confidence frame editor with save-and-next workflow."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout,
 )
@@ -23,10 +24,10 @@ class ActiveLearningReviewDialog(QDialog):
         rows = load_box_labels(labels_csv)
         self.indices = [
             int(index) for index, row in rows.iterrows()
-            if str(row.get("review_batch", "")) == self.batch_id and not bool(row.exclude)
+            if str(row.get("review_batch", "")) == self.batch_id
         ]
         if not self.indices:
-            raise ValueError(f"No non-excluded frames remain in active-learning batch {self.batch_id}")
+            raise ValueError(f"No frames in active-learning batch {self.batch_id}")
         self.position = 0
         self.canvas: BoxCanvas | None = None
         self.setWindowTitle(f"Active-learning box review — {self.batch_id}")
@@ -69,7 +70,7 @@ class ActiveLearningReviewDialog(QDialog):
         box = tuple(values) if np.isfinite(values).all() else None
         self.canvas = BoxCanvas(image, box)
         self.canvas_layout.addWidget(self.canvas)
-        self.exclude.setChecked(False)
+        self.exclude.setChecked(bool(row.exclude))
         confidence = float(row.get("model_confidence", row.confidence))
         reviewed = sum(bool(rows.iloc[index].reviewed) for index in self.indices)
         self.progress.setText(
@@ -86,7 +87,10 @@ class ActiveLearningReviewDialog(QDialog):
             QMessageBox.warning(self, "Missing box", "Draw a box or exclude this frame.")
             return False
         update_box_label(
-            self.labels_csv, self.indices[self.position], self.canvas.box, self.exclude.isChecked()
+            self.labels_csv,
+            self.indices[self.position],
+            self.canvas.box,
+            self.exclude.isChecked(),
         )
         return True
 
@@ -100,18 +104,13 @@ class ActiveLearningReviewDialog(QDialog):
             self.accept()
 
     def save_next(self) -> None:
-        excluded = self.exclude.isChecked()
         if not self._save():
             return
-        if excluded:
-            # The following row slides into the same position after removal.
-            self.indices.pop(self.position)
-        else:
-            self.position += 1
-        if not self.indices or self.position >= len(self.indices):
-            QMessageBox.information(self, "Review complete", "Every available frame has been visited.")
+        if self.position + 1 >= len(self.indices):
+            QMessageBox.information(self, "Review complete", "Every frame in this batch has been visited.")
             self.accept()
             return
+        self.position += 1
         self.load_current()
 
 
