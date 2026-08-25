@@ -53,6 +53,15 @@ class HeadFusionTests(unittest.TestCase):
         self.assertEqual(result.source, "temporal_short_gap")
         self.assertEqual(result.point, (17., 10.))
 
+    def test_long_missing_gap_clears_stale_direction(self):
+        stabilizer = HeadTemporalStabilizer(max_gap_frames=2)
+        stabilizer.update((10, 10), HeadChoice((15, 10), .8, "reflection", None))
+        stabilizer.update(None, HeadChoice(None, 0, "missing", None))
+        stabilizer.update(None, HeadChoice(None, 0, "missing", None))
+        stabilizer.update(None, HeadChoice(None, 0, "missing", None))
+        result = stabilizer.update((80, 80), HeadChoice(None, 0, "missing", None))
+        self.assertIsNone(result.point)
+
     def test_annotation_selection_prioritizes_failures(self):
         rows = pd.DataFrame({"frame": [1, 2, 3], "head_x_cm": [1, 1, 8],
                              "head_y_cm": [1, 1, 8], "head_confidence": [.9, .2, .8],

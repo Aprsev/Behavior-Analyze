@@ -30,6 +30,8 @@ from mouse_behavior_pipeline import (  # noqa: E402
     perspective_geometry, rectified_to_cm, robust_threshold, sample_frames, video_properties,
 )
 from model import checkpoint_model, unpack_outputs  # noqa: E402
+from anatomical_head import (AnatomicalHeadConstraint, appendage_foreground,
+                             clamp_choice_to_mask)  # noqa: E402
 from head_fusion import (HeadChoice, HeadTemporalStabilizer, choose_head,
                          choose_reflection)  # noqa: E402
 from label_compat import as_bool, video_mask  # noqa: E402
@@ -170,6 +172,7 @@ def main() -> None:
     mw = cv2.VideoWriter(str(out / "mouse_miniscope_mask.mp4"), fourcc, fps, (w, h))
     tracker = ReflectionTracker(fps)
     head_temporal = HeadTemporalStabilizer(max_gap_frames=max(5, round(fps * 0.5)))
+    head_anatomy = AnatomicalHeadConstraint()
     temporal = TemporalMaskFilter(fps=fps, opening_px=a.fibre_opening, hold_frames=3,
                                   reacquire_frames=max(8, round(fps * a.reacquire_sec)))
     manual_heads = pd.DataFrame()
@@ -194,6 +197,8 @@ def main() -> None:
         reflection_conf = learned_reflection_conf = 0.0
         head_source = "excluded" if i in excluded else "missing"
         disagreement = np.nan
+        anatomy_corrected = False; body_elongation = np.nan
+        tail_hint_detected = False; head_outside_distance = np.nan
         if i in excluded:
             body = head = None; conf = 0.0; overlay = frame.copy()
             cv2.rectangle(overlay, (0, 0), (overlay.shape[1] - 1, overlay.shape[0] - 1), (0, 0, 220), 6)
@@ -212,6 +217,11 @@ def main() -> None:
                 reflection_prob = (torch.sigmoid(reflection_logits)[0, 0].cpu().numpy()
                                    if reflection_logits is not None and learned_reflection_enabled else None)
             filtered = temporal.update(prob, a.threshold)
+            if filtered.status == "acquired" and i > 0:
+                # A released body prior means continuity across the gap is no
+                # longer valid for head/tail orientation either.
+                head_anatomy.reset()
+                head_temporal.reset()
             if filtered.centroid is not None:
                 mask_src = cv2.resize(filtered.mask, (frame.shape[1], frame.shape[0]),
                                       interpolation=cv2.INTER_NEAREST)
@@ -230,13 +240,15 @@ def main() -> None:
                     body = (m["m10"] / m["m00"], m["m01"] / m["m00"])
                     rect = cv2.warpPerspective(frame, forward, (rw, rh))
                     # New checkpoints learn a head heatmap from the existing
-                    # manual red-point labels. Restrict its maximum to a
-                    # dilated clean body mask so a highlight on the fibre
+                    # manual red-point labels. Restrict its maximum to the
+                    # clean body mask so a highlight on the fibre
                     # cannot become the head. Old checkpoints fall back to
                     # the reflection tracker.
                     learned_conf = 0.0
-                    allowed = cv2.dilate(filtered.mask,
-                                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))) > 0
+                    # Network candidates must start inside the clean green
+                    # mask. A second rectified-space clamp is applied after
+                    # fusion and temporal stabilization.
+                    allowed = filtered.mask > 0
                     if head_prob is not None:
                         constrained = np.where(allowed, head_prob, 0.0)
                         learned_conf = float(constrained.max())
@@ -312,7 +324,27 @@ def main() -> None:
                     if head is None and not manual_head_absent:
                         choice = choose_head(reflection, reflection_conf,
                                              learned_head, learned_conf)
+                        # Inspect both the raw pre-opening CNN foreground and
+                        # dark static-background residual. Opening removes the
+                        # thin tail and fibre from the green mask; here they are
+                        # restored only as anatomical side cues.
+                        raw_model_src = cv2.resize(
+                            (prob >= a.threshold).astype(np.uint8) * 255,
+                            (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                        raw_model_rect = cv2.warpPerspective(
+                            raw_model_src, forward, (rw, rh), flags=cv2.INTER_NEAREST)
+                        if wall_mask is not None:
+                            raw_model_rect[wall_mask > 0] = 0
+                        foreground = appendage_foreground(
+                            rect, background, body_mask, raw_model_rect)
+                        anatomy = head_anatomy.update(body, body_mask, foreground, choice)
+                        choice = anatomy.choice
+                        anatomy_corrected = anatomy.corrected
+                        body_elongation = anatomy.elongation
+                        tail_hint_detected = anatomy.tail_detected
+                        head_outside_distance = anatomy.outside_distance_px
                         choice = head_temporal.update(body, choice)
+                        choice = clamp_choice_to_mask(choice, body_mask)
                         head, conf, head_source = choice.point, choice.confidence, choice.source
                         disagreement = choice.disagreement_px if choice.disagreement_px is not None else np.nan
                     else:
@@ -347,6 +379,13 @@ def main() -> None:
                 cv2.putText(overlay, f"R {reflection_source} {reflection_conf:.2f}",
                             (12, 24), cv2.FONT_HERSHEY_SIMPLEX, .48,
                             (255, 255, 255), 1, cv2.LINE_AA)
+                if np.isfinite(body_elongation):
+                    anatomy_text = (f"A {'FIX' if anatomy_corrected else 'KEEP'} "
+                                    f"elong={body_elongation:.2f} tail={int(tail_hint_detected)}")
+                    cv2.putText(overlay, anatomy_text, (12, 46),
+                                cv2.FONT_HERSHEY_SIMPLEX, .43,
+                                (0, 220, 255) if anatomy_corrected else (255, 255, 255),
+                                1, cv2.LINE_AA)
         overlay_write = np.rot90(overlay, -k) if k else overlay
         if mask_src is None:
             mask_write = np.zeros((h, w), np.uint8)
@@ -365,7 +404,8 @@ def main() -> None:
                      reflection_cm[0], reflection_cm[1], learned_cm[0], learned_cm[1],
                      learned_reflection_cm[0], learned_reflection_cm[1],
                      learned_reflection_conf, reflection_source, reflection_disagreement,
-                     head_source, disagreement))
+                     head_source, disagreement, anatomy_corrected, body_elongation,
+                     tail_hint_detected, head_outside_distance))
         i += 1
     cap.release(); ow.release(); mw.release()
     df = pd.DataFrame(rows, columns=["frame", "timestamp_sec", "body_x_cm", "body_y_cm",
@@ -375,13 +415,18 @@ def main() -> None:
                                      "learned_reflection_x_cm", "learned_reflection_y_cm",
                                      "learned_reflection_confidence", "reflection_source",
                                      "reflection_disagreement_px",
-                                     "head_source", "head_disagreement_px"])
+                                     "head_source", "head_disagreement_px",
+                                     "head_anatomy_corrected", "body_elongation",
+                                     "tail_hint_detected", "head_outside_distance_px"])
     df.to_csv(out / "head_track_trajectory.csv", index=False, float_format="%.5f")
     (out / "head_track_metadata.json").write_text(json.dumps(
         {"input": str(Path(a.video).resolve()), "model": str(Path(a.model).resolve()),
          "device": dev, "frames": i, "threshold": a.threshold, "rotate": a.rotate,
          "bg_subtract": bg_small is not None, "in_channels": in_channels,
-         "head_policy": "reflection_primary_temporal_learned_fallback",
+         "head_policy": "reflection_primary_anatomical_temporal_fallback",
+         "anatomical_head_constraint": {
+             "mask_containment": True, "major_axis_endpoints": True,
+             "contained_tail_vs_boundary_fibre": True, "flip_confirm_frames": 4},
          "head_source_counts": {str(k): int(v) for k, v in df.head_source.value_counts().items()},
          "reflection_policy": ("learned_primary_heuristic_fallback"
                                if learned_reflection_enabled
@@ -397,6 +442,10 @@ def main() -> None:
              100 * float(df.learned_reflection_x_cm.notna().mean()), 2),
          "learned_candidate_percent": round(100 * float(df.learned_head_x_cm.notna().mean()), 2),
          "head_valid_percent": round(100 * float(df.head_x_cm.notna().mean()), 2),
+         "head_anatomy_corrected_percent": round(
+             100 * float(df.head_anatomy_corrected.map(as_bool).mean()), 2),
+         "tail_hint_detected_percent": round(
+             100 * float(df.tail_hint_detected.map(as_bool).mean()), 2),
          "head_reliable_percent": round(100 * float((df.head_x_cm.notna() &
                                                        (df.head_confidence >= 0.20)).mean()), 2),
          "excluded_frames": sorted(excluded & set(range(i)))}, indent=2), encoding="utf-8")

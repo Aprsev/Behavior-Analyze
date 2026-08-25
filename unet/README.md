@@ -281,6 +281,16 @@ Outputs of inference include `mouse_miniscope_mask.mp4`,
 contains the CNN mask centroid; it is a clean body input for the later
 head/reflection pipeline.
 
+Final head tracking applies an anatomical constraint after Reflection/Head
+fusion. Automatic points are clamped to the clean green mask. Elongated masks
+are reduced to their two PCA major-axis endpoints, and body-relative direction
+continuity prevents one-frame head/tail flips. Before morphological opening,
+dark thin structures connected to the body are examined as appendages: a branch
+reaching the rectified FOV boundary is treated as fibre, while a contained thin
+branch supplies a tail-side cue and selects the opposite endpoint as Head. The
+trajectory CSV reports `head_anatomy_corrected`, `body_elongation`,
+`tail_hint_detected`, and `head_outside_distance_px` for auditing.
+
 ### Coordinate calibration & wall-band exclusion
 
 The ROI often includes the arena walls because the camera sees the mouse's

@@ -93,9 +93,15 @@ class HeadTemporalStabilizer:
         self.gap = 0
         self.max_gap_frames = max(1, int(max_gap_frames))
 
+    def reset(self) -> None:
+        self.relative = None
+        self.gap = 0
+
     def update(self, body, choice: HeadChoice) -> HeadChoice:
         if body is None:
             self.gap += 1
+            if self.gap > self.max_gap_frames:
+                self.relative = None
             return choice
         b = np.asarray(body, dtype=float)
         point = np.asarray(choice.point, dtype=float) if choice.point is not None else None
@@ -125,4 +131,6 @@ class HeadTemporalStabilizer:
             confidence = max(0.02, 0.18 * (1.0 - self.gap / (self.max_gap_frames + 1)))
             return HeadChoice(tuple(map(float, predicted)), confidence,
                               "temporal_short_gap", choice.disagreement_px)
+        if self.gap > self.max_gap_frames:
+            self.relative = None
         return choice
