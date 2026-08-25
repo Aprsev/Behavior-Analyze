@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import cv2
 import numpy as np
@@ -28,9 +29,30 @@ def _main_contour(mask: np.ndarray) -> np.ndarray | None:
 
 
 def _nearest_contour(point: np.ndarray, contour: np.ndarray) -> tuple[np.ndarray, float]:
-    distance = np.linalg.norm(contour - point[None], axis=1)
+    distance = np.sqrt(np.sum((contour - point[None]) ** 2, axis=1))
     index = int(distance.argmin())
     return contour[index].copy(), float(distance[index])
+
+
+def _principal_axis(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Analytic 2-D PCA without BLAS/LAPACK/OpenMP runtime initialization."""
+    points = np.asarray(points, np.float32).reshape(-1, 2)
+    center = points.mean(axis=0)
+    delta = points - center
+    sxx = float(np.mean(delta[:, 0] * delta[:, 0]))
+    syy = float(np.mean(delta[:, 1] * delta[:, 1]))
+    sxy = float(np.mean(delta[:, 0] * delta[:, 1]))
+    discriminant = math.sqrt(max(0.0, (sxx - syy) ** 2 + 4.0 * sxy * sxy))
+    major = 0.5 * (sxx + syy + discriminant)
+    minor = 0.5 * (sxx + syy - discriminant)
+    if abs(sxy) > 1e-12:
+        axis = np.asarray([major - syy, sxy], np.float32)
+    elif sxx >= syy:
+        axis = np.asarray([1.0, 0.0], np.float32)
+    else:
+        axis = np.asarray([0.0, 1.0], np.float32)
+    axis /= max(math.hypot(float(axis[0]), float(axis[1])), 1e-6)
+    return center, axis, major, max(minor, 0.0)
 
 
 def clamp_choice_to_mask(choice: HeadChoice, mask: np.ndarray) -> HeadChoice:
@@ -69,12 +91,8 @@ class AnatomicalHeadConstraint:
         contour = _main_contour(mask)
         if contour is None:
             return None
-        mean, eigenvectors, eigenvalues = cv2.PCACompute2(contour, mean=None)
-        center = mean[0]
-        axis = eigenvectors[0]
-        axis /= max(float(np.linalg.norm(axis)), 1e-6)
-        values = np.sort(eigenvalues[:, 0])[::-1]
-        elongation = float(np.sqrt(max(values[0], 1e-6) / max(values[1], 1e-6)))
+        center, axis, major, minor = _principal_axis(contour)
+        elongation = float(math.sqrt(max(major, 1e-6) / max(minor, 1e-6)))
         projection = (contour - center) @ axis
         low_cut, high_cut = np.percentile(projection, [4, 96])
         low = contour[projection <= low_cut].mean(axis=0)
@@ -108,17 +126,21 @@ class AnatomicalHeadConstraint:
             x, y, w, h = (int(stats[label, key]) for key in (
                 cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
             component_points = np.column_stack(np.where(component))[:, ::-1].astype(np.float32)
-            covariance = np.cov(component_points, rowvar=False) if len(component_points) >= 3 else np.eye(2)
-            eigenvalues = np.sort(np.linalg.eigvalsh(covariance))[::-1]
-            slenderness = float(np.sqrt(max(eigenvalues[0], 1e-6) /
-                                        max(eigenvalues[1], 1e-6)))
+            if len(component_points) >= 3:
+                _, _, branch_major, branch_minor = _principal_axis(component_points)
+                slenderness = float(math.sqrt(max(branch_major, 1e-6) /
+                                              max(branch_minor, 1e-6)))
+            else:
+                slenderness = 1.0
             length = float(max(w, h))
             if length < max(7.0, 0.16 * body_span) or slenderness < 2.0:
                 continue
             if x <= 2 or y <= 2 or x + w >= width - 2 or y + h >= height - 2:
                 continue
             center = centers[label].astype(np.float32)
-            endpoint_index = int(np.argmin([np.linalg.norm(center - point) for point in endpoints]))
+            endpoint_index = int(np.argmin([
+                math.hypot(float(center[0] - point[0]), float(center[1] - point[1]))
+                for point in endpoints]))
             score = length * min(slenderness, 8.0) + 0.05 * area
             choices.append((score, endpoint_index))
         return max(choices, default=(0.0, None), key=lambda item: item[0])[1]
@@ -147,7 +169,8 @@ class AnatomicalHeadConstraint:
         directions = []
         for endpoint in endpoints:
             direction = endpoint - b
-            directions.append(direction / max(float(np.linalg.norm(direction)), 1e-6))
+            directions.append(direction / max(
+                math.hypot(float(direction[0]), float(direction[1])), 1e-6))
 
         if tail_index is not None:
             head_index = 1 - tail_index
@@ -155,7 +178,9 @@ class AnatomicalHeadConstraint:
             head_index = int(np.argmax([float(np.dot(direction, self.previous_direction))
                                         for direction in directions]))
         elif candidate is not None:
-            head_index = int(np.argmin([np.linalg.norm(candidate - point) for point in endpoints]))
+            head_index = int(np.argmin([
+                math.hypot(float(candidate[0] - point[0]), float(candidate[1] - point[1]))
+                for point in endpoints]))
         else:
             return AnatomyResult(choice, elongation, False, corrected, outside_distance)
 
@@ -190,7 +215,8 @@ class AnatomicalHeadConstraint:
 
         self.previous_direction = proposed_direction if self.previous_direction is None else (
             0.82 * self.previous_direction + 0.18 * proposed_direction)
-        self.previous_direction /= max(float(np.linalg.norm(self.previous_direction)), 1e-6)
+        self.previous_direction /= max(
+            math.hypot(float(self.previous_direction[0]), float(self.previous_direction[1])), 1e-6)
         constrained = HeadChoice(tuple(map(float, candidate)), float(confidence), source,
                                  choice.disagreement_px)
         constrained = clamp_choice_to_mask(constrained, body_mask)
