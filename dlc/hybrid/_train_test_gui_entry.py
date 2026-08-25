@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Primary GUI entry point including active YOLO label refinement."""
+"""Primary GUI entry point with isolated, path-safe train/test video sets."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from dlc.hybrid.active_learning_gui import ActiveLearningWorkbench
+from dlc.hybrid.path_safe_gui import PathSafeMultiVideoWorkbench
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Mouse Pose Hybrid Workbench")
-    window = ActiveLearningWorkbench()
+    window = PathSafeMultiVideoWorkbench()
     window.show()
     return app.exec()
 
