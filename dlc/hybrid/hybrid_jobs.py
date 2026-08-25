@@ -1,57 +1,47 @@
 #!/usr/bin/env python3
-"""Safe Hybrid worker entry point for reviewed active-learning datasets."""
+"""Hybrid worker entry point with portable Ultralytics device selection."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 import sys
+from typing import Callable
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from dlc.hybrid import _active_jobs_impl as _impl
-from dlc.hybrid._active_jobs_impl import *  # noqa: E402,F401,F403
-from dlc.hybrid._hybrid_pipeline_impl import load_box_labels
+from dlc.hybrid import _review_guard_jobs as _base
+from dlc.hybrid._review_guard_jobs import *  # noqa: E402,F401,F403
+from dlc.hybrid.device import normalize_yolo_device
 
 
-def pending_active_reviews(cfg: dict) -> int:
-    labels = Path(cfg["yolo"]["dataset_dir"]) / "box_labels.csv"
-    if not labels.is_file():
-        return 0
-    rows = load_box_labels(labels)
-    if "review_batch" not in rows:
-        return 0
-    active = rows.review_batch.astype(str).str.startswith("active_")
-    return int((active & ~rows.reviewed).sum())
+def _run(action: str, cfg: dict) -> None:
+    # Resolve the GUI's portable "auto" value only in this worker process.  The
+    # saved JSON remains portable between CUDA, Apple Silicon, and CPU hosts.
+    normalize_yolo_device(cfg)
+    _base.ALL_JOBS[action](cfg)
 
 
-def require_review_complete(cfg: dict) -> None:
-    pending = pending_active_reviews(cfg)
-    if pending:
-        raise RuntimeError(
-            f"{pending} active-learning frames are still unsaved. Finish the frame-by-frame review before export or training."
-        )
+def _wrapped(action: str) -> Callable[[dict], None]:
+    def run(cfg: dict) -> None:
+        _run(action, cfg)
+
+    run.__name__ = getattr(_base.ALL_JOBS[action], "__name__", f"job_{action}")
+    return run
 
 
-def job_export_reviewed_dataset(cfg: dict) -> None:
-    require_review_complete(cfg)
-    _impl.ALL_JOBS["export_yolo"](cfg)
+ALL_JOBS = {name: _wrapped(name) for name in _base.ALL_JOBS}
 
 
-def job_fine_tune_yolo(cfg: dict) -> None:
-    require_review_complete(cfg)
-    dataset = Path(cfg["yolo"]["dataset_dir"])
-    labels, yaml = dataset / "box_labels.csv", dataset / "data.yaml"
-    if labels.is_file() and (not yaml.is_file() or yaml.stat().st_mtime < labels.stat().st_mtime):
-        raise RuntimeError("Labels changed after the last export. Export the combined dataset before fine-tuning.")
-    _impl.job_fine_tune_yolo(cfg)
-
-
-ALL_JOBS = dict(_impl.ALL_JOBS)
-ALL_JOBS["export_yolo"] = job_export_reviewed_dataset
-ALL_JOBS["fine_tune_yolo"] = job_fine_tune_yolo
+# Keep direct imports used by integrations and tests on the same safe path.
+job_train_yolo = ALL_JOBS["train_yolo"]
+job_validate_yolo = ALL_JOBS["validate_yolo"]
+job_prepare_hybrid = ALL_JOBS["prepare_hybrid"]
+job_full_hybrid = ALL_JOBS["full_hybrid"]
+job_mine_active_frames = ALL_JOBS["mine_active_frames"]
+job_fine_tune_yolo = ALL_JOBS["fine_tune_yolo"]
 
 
 def main() -> int:
@@ -59,7 +49,7 @@ def main() -> int:
     parser.add_argument("action", choices=sorted(ALL_JOBS))
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
-    cfg = _impl.load_config(args.config)
+    cfg = _base._impl.load_config(args.config)
     print(f"=== {args.action} ===", flush=True)
     ALL_JOBS[args.action](cfg)
     print(f"=== {args.action} completed ===", flush=True)
