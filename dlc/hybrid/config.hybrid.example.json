@@ -1,16 +1,25 @@
 {
-  "videos": [
-    "../data/12026-08-12 160535.avi"
+  "config_schema_version": 2,
+  "training_videos": [
+    "../../data/training_mouse_01.avi",
+    "../../data/training_mouse_02.avi"
   ],
-  "video": "../data/12026-08-12 160535.avi",
-  "roi_json": "../traditional/basic_rois/160535_roi.json",
-  "output_dir": "../results/hybrid_dlc",
-  "working_directory": "../dlc_projects",
+  "training_rois": [
+    "../../traditional/basic_rois/shared_arena_roi.json"
+  ],
+  "test_videos": [
+    "../../data/held_out_mouse_01.avi"
+  ],
+  "test_rois": [
+    "../../traditional/basic_rois/shared_arena_roi.json"
+  ],
+  "output_dir": "../../results/hybrid_dlc",
+  "working_directory": "../../dlc_projects",
   "project_config": "",
   "arena_width_cm": 25.0,
   "arena_height_cm": 30.0,
   "yolo": {
-    "dataset_dir": "../yolo_datasets/mouse",
+    "dataset_dir": "../../yolo_datasets/mouse",
     "samples_per_video": 80,
     "background_samples": 61,
     "background_percentile": 85.0,
@@ -124,9 +133,7 @@
     "label_frames": {},
     "check_labels": {},
     "build_dataset": {},
-    "train": {
-      "pytorch_cfg_updates": {}
-    },
+    "train": {"pytorch_cfg_updates": {}},
     "evaluate": {},
     "analyze": {},
     "filter_predictions": {},
