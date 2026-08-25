@@ -1,9 +1,2 @@
-# 1. Install the CUDA build of torch/torchvision that matches the execution host.
-# 2. Install this file. The first YOLO/DLC run downloads pretrained weights.
-deeplabcut[gui,modelzoo]>=3.0.0,<4
-ultralytics>=8.3
-PySide6>=6.6
-opencv-contrib-python>=4.8
-numpy>=1.24
-pandas>=2.0,<3
-tables>=3.9
+# Compatibility include; canonical dependency group lives under requirements/.
+-r requirements/requirements-hybrid.txt

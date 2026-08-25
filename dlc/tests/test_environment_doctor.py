@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-import environment_doctor as doctor
+from dlc.tools import environment_doctor as doctor
 
 
 class VersionTests(unittest.TestCase):
@@ -17,7 +17,15 @@ class VersionTests(unittest.TestCase):
 
 class PlanTests(unittest.TestCase):
     def test_plan_uses_current_python_and_selected_torch_index(self) -> None:
-        broken = [doctor.CheckResult("DeepLabCut", "MISSING", None, "missing", "deeplabcut[gui,modelzoo]>=3,<4")]
+        broken = [
+            doctor.CheckResult(
+                "DeepLabCut",
+                "MISSING",
+                None,
+                "missing",
+                "deeplabcut[gui,modelzoo]>=3,<4",
+            )
+        ]
         commands = doctor.build_install_commands(broken, "cu126", None, False, False)
         self.assertEqual(commands[0][:4], [doctor.sys.executable, "-m", "pip", "install"])
         self.assertEqual(commands[0][-1], doctor.TORCH_INDEXES["cu126"])
@@ -26,7 +34,15 @@ class PlanTests(unittest.TestCase):
     @patch.object(doctor, "installed_opencv_distributions")
     def test_opencv_cleanup_only_occurs_with_explicit_flag(self, installed) -> None:
         installed.return_value = {"opencv-python": "4.10.0"}
-        broken = [doctor.CheckResult("OpenCV contrib", "BROKEN", "4.10", "missing capability", "opencv-contrib-python>=4.8")]
+        broken = [
+            doctor.CheckResult(
+                "OpenCV contrib",
+                "BROKEN",
+                "4.10",
+                "missing capability",
+                "opencv-contrib-python>=4.8",
+            )
+        ]
         without_fix = doctor.build_install_commands(broken, "keep", None, False, False)
         with_fix = doctor.build_install_commands(broken, "keep", None, True, False)
         self.assertNotIn("uninstall", without_fix[0])

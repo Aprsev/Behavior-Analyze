@@ -1,5 +1,8 @@
-# Per-computer Hybrid Workbench state and optional local weights
-hybrid_config.json
+# Per-computer GUI state and generated model artifacts
+hybrid/hybrid_config.json
+legacy/config.json
 *.pt
 *.pb
+*.onnx
 __pycache__/
+**/__pycache__/
