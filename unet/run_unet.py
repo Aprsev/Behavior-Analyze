@@ -208,6 +208,22 @@ def annotate_head_results_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
         "--max-labels", str(a.max_labels), "--rotate", str(a.rotate)]
 
 
+def incremental_review_cmd(v: dict, cfg: dict, a) -> tuple[Path, list[str]]:
+    out = Path(v["infer_out"])
+    return UNET / "incremental_review.py", [
+        "--video", str(cfg["video"]),
+        "--trajectory", str(out / "head_track_trajectory.csv"),
+        "--mask-video", str(out / "mouse_miniscope_mask.mp4"),
+        "--overlay-video", str(out / "head_track_overlay.mp4"),
+        "--roi-json", str(cfg["roi"]), "--labels", str(v["labels"]),
+        "--heads", str(v["heads"]),
+        "--candidate-csv", str(out / "incremental_training_candidates.csv"),
+        "--session-json", str(out / "incremental_training_session.json"),
+        "--arena-width-cm", f"{a.arena_width_cm:.2f}",
+        "--arena-height-cm", f"{a.arena_height_cm:.2f}",
+        "--rotate", str(a.rotate), "--max-candidates", "200"]
+
+
 def roi_cmd(v: dict) -> tuple[Path, list[str]]:
     return UNET / "make_roi.py", ["--video", str(v["video"])]
 

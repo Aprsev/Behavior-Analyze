@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 UNET = Path(__file__).resolve().parents[2] / 'unet'
 sys.path.insert(0, str(UNET))
-from label_compat import as_bool, normalize_polygon, video_mask  # noqa: E402
+from core.label_compat import as_bool, normalize_polygon, video_mask  # noqa: E402
 from mouse_behavior_pipeline import (
     perspective_geometry, robust_threshold, sample_frames, segment_mouse, video_properties,
 )
@@ -128,7 +128,8 @@ def _select_frames(args, labels: dict, cap: cv2.VideoCapture, total: int,
             raise SystemExit(f'No screening rows for {Path(args.input).name}.\n'
                              f'Run screening first: python unet/run_unet.py screen')
         keep = cand.loc[~cand.exclude.map(as_bool)].frame.astype(int)
-        frames = [f for f in dict.fromkeys(int(f) for f in keep) if f not in labels]
+        frames = [f for f in dict.fromkeys(int(f) for f in keep)
+                  if args.only_modified or f not in labels]
         print(f'Using {len(frames)} screened candidate frames (junk already removed).')
         return frames[:args.max_labels]
     picks = pick_diverse_frames(cap, total, forward, rw, rh, background, threshold, args.max_labels, set())
@@ -196,6 +197,10 @@ def main() -> None:
     p.add_argument('--roi-json',required=True); p.add_argument('--output',required=True)
     p.add_argument('--arena-width-cm',type=float,required=True); p.add_argument('--arena-height-cm',type=float,required=True)
     p.add_argument('--max-labels',type=int,default=50); p.add_argument('--candidate-csv',default='')
+    p.add_argument('--mask-video', default='',
+                   help='optional mask video used as the initial editable U-Net contour')
+    p.add_argument('--only-modified', action='store_true',
+                   help='write only frames whose polygon was actually edited')
     p.add_argument('--review-existing', action='store_true',
                    help='review and overwrite existing labels for this video instead of selecting new frames')
     args=p.parse_args()
@@ -213,7 +218,10 @@ def main() -> None:
     rect_samples=np.stack([cv2.warpPerspective(frame,forward,(rw,rh)) for frame in samples])
     background=np.percentile(rect_samples,85,axis=0).astype(np.uint8)
     threshold,_=robust_threshold(rect_samples,background,0)
-    cap=cv2.VideoCapture(args.input); title='Polygon torso correction (cyan); remove fibre/tail'
+    cap=cv2.VideoCapture(args.input)
+    mask_cap=(cv2.VideoCapture(args.mask_video)
+              if args.mask_video and Path(args.mask_video).is_file() else None)
+    title='Polygon torso correction (cyan); remove fibre/tail'
     if args.review_existing:
         frames = sorted(frame for frame, row in labels.items()
                         if isinstance(row.get('polygon_px'), str) and row.get('polygon_px'))
@@ -229,7 +237,7 @@ def main() -> None:
     if not args.review_existing:
         print(f'{Path(args.input).name}: {len(labels)} frames already labelled, '
               f'{len(frames)} NEW unlabelled frames to label (max {args.max_labels} per run).')
-    state={'i':0,'points':None,'drag':None}
+    state={'i':0,'points':None,'drag':None,'dirty':False,'touched':set()}
     def frame_image(frame):
         cap.set(cv2.CAP_PROP_POS_FRAMES,frame); ok,img=cap.read()
         if not ok: raise RuntimeError(f'Cannot read frame {frame}')
@@ -238,6 +246,17 @@ def main() -> None:
         # The same dark-foreground / compact-torso segmentation used in the
         # tracking pipeline supplies the initial editable contour.
         image=frame_image(frame)
+        if mask_cap is not None:
+            mask_cap.set(cv2.CAP_PROP_POS_FRAMES,frame); ok,mask_frame=mask_cap.read()
+            if ok:
+                gray=cv2.cvtColor(mask_frame,cv2.COLOR_BGR2GRAY)
+                contours,_=cv2.findContours((gray>127).astype(np.uint8),cv2.RETR_EXTERNAL,
+                                            cv2.CHAIN_APPROX_NONE)
+                if contours:
+                    contour=max(contours,key=cv2.contourArea).reshape(-1,2).astype(float)
+                    contour[:,0]*=image.shape[1]/gray.shape[1]
+                    contour[:,1]*=image.shape[0]/gray.shape[0]
+                    return simplify(contour,8)
         rectified=cv2.warpPerspective(image,forward,(rw,rh))
         detection=segment_mouse(rectified,background,threshold,None,float('inf'),None)
         if detection.contour is not None:
@@ -257,9 +276,11 @@ def main() -> None:
         if row is not None and isinstance(row.polygon_px,str) and row.polygon_px:
             state['points']=normalize_polygon(row.polygon_px).astype(float)
         else: state['points']=auto_polygon(frame)
-        state['drag']=None
+        state['drag']=None; state['dirty']=False
     def commit_current():
         """Keep the current editable polygon in memory before any navigation."""
+        if args.only_modified and not state['dirty']:
+            return False
         frame = frames[state['i']]
         previous = labels.get(frame)
         excluded = as_bool(previous.exclude) if previous is not None else False
@@ -268,6 +289,8 @@ def main() -> None:
             'polygon_px': json.dumps(np.asarray(state['points']).round(1).tolist()),
             'exclude': excluded,
         })
+        state['touched'].add(frame); state['dirty']=False
+        return True
     def nearest(x,y):
         distance=np.linalg.norm(state['points']-np.asarray([x,y]),axis=1)
         return int(distance.argmin()),float(distance.min())
@@ -282,12 +305,19 @@ def main() -> None:
                 t=np.clip(np.sum(q*edges,axis=1)/np.maximum(np.sum(edges*edges,axis=1),1e-6),0,1)
                 d=np.linalg.norm(q-edges*t[:,None],axis=1); idx=int(d.argmin())+1
                 state['points']=np.insert(pts,idx,[x,y],axis=0); state['drag']=idx
+            state['dirty']=True
         elif event==cv2.EVENT_MOUSEMOVE and state['drag'] is not None: state['points'][state['drag']]=[x,y]
         elif event==cv2.EVENT_LBUTTONUP: state['drag']=None
     def save():
         commit_current()
         rows=[]
-        for frame,row in labels.items(): rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':as_bool(row.exclude),'video':Path(args.input).name})
+        selected=(state['touched'] if args.only_modified else labels.keys())
+        for frame in selected:
+            row=labels[frame]
+            rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':as_bool(row.exclude),'video':Path(args.input).name,'source':'incremental_small_mask_correction' if args.only_modified else 'torso_constraint'})
+        if not rows:
+            print('No polygon was modified; no training label was added.')
+            return
         # Merge into the shared CSV: this session only replaces its own
         # (video, frame) rows; every other video's annotations are kept.
         merge_labels(Path(args.output), Path(args.input).name, rows)
@@ -314,10 +344,10 @@ def main() -> None:
             save()
             if state['i'] < len(frames)-1:
                 state['i'] += 1; load()
-        elif k==ord('r'): state['points']=auto_polygon(frame)
-        elif k==ord('t'): state['points']=simplify(np.asarray(state['points']),8)
+        elif k==ord('r'): state['points']=auto_polygon(frame); state['dirty']=True
+        elif k==ord('t'): state['points']=simplify(np.asarray(state['points']),8); state['dirty']=True
         elif k in (8,127) and len(state['points'])>3:
-            idx,_=nearest(*state['points'].mean(axis=0)); state['points']=np.delete(state['points'],idx,axis=0)
+            idx,_=nearest(*state['points'].mean(axis=0)); state['points']=np.delete(state['points'],idx,axis=0); state['dirty']=True
         elif k in (ord('e'),ord('E')):
             # Toggle exclusion so an accidentally discarded old label can be restored.
             commit_current()
@@ -329,6 +359,8 @@ def main() -> None:
         elif k in (83,ord('d')): commit_current(); state['i']=min(len(frames)-1,state['i']+1); load()
         elif k==ord('j'): commit_current(); state['i']=max(0,state['i']-10); load()
         elif k==ord('l'): commit_current(); state['i']=min(len(frames)-1,state['i']+10); load()
-    cap.release();cv2.destroyAllWindows()
+    cap.release()
+    if mask_cap is not None: mask_cap.release()
+    cv2.destroyAllWindows()
 
 if __name__=='__main__': main()

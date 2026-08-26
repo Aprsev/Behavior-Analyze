@@ -6,7 +6,7 @@ import unittest
 
 import pandas as pd
 
-from label_compat import (as_bool, atomic_upsert_head, atomic_upsert_polygon,
+from core.label_compat import (as_bool, atomic_upsert_head, atomic_upsert_polygon,
                           normalize_polygon, video_matches)
 
 

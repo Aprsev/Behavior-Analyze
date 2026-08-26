@@ -2,11 +2,37 @@
 import unittest
 import numpy as np
 import pandas as pd
-from head_fusion import HeadChoice, HeadTemporalStabilizer, choose_head, choose_reflection
-from annotate_head_results import select_frames
+from tracking.head_fusion import HeadChoice, HeadTemporalStabilizer, choose_head, choose_reflection
+from annotation.annotate_head_results import select_frames
 
 
 class HeadFusionTests(unittest.TestCase):
+    def test_anatomical_reflection_immediately_reseeds_direction(self):
+        stabilizer = HeadTemporalStabilizer()
+        stabilizer.update((50, 50), HeadChoice((75, 50), .8, "learned_head", None))
+        corrected = stabilizer.update(
+            (50, 50), HeadChoice(
+                (25, 50), .8, "anatomical_confirmed_reflection", None))
+        self.assertLess(corrected.point[0], 50)
+        self.assertEqual(corrected.source, "anatomical_confirmed_reflection")
+
+    def test_unconfirmed_reflection_is_smoothed_not_immediately_trusted(self):
+        stabilizer = HeadTemporalStabilizer()
+        stabilizer.update(
+            (50, 50), HeadChoice(
+                (75, 50), .8, "anatomical_confirmed_reflection", None))
+        result = stabilizer.update(
+            (50, 50), HeadChoice((25, 50), .8,
+                                 "anatomical_reflection_model_disagrees", None))
+        self.assertGreater(result.point[0], 50)
+        self.assertTrue(result.source.startswith("temporal_"))
+
+    def test_head_choice_preserves_reflection_provenance(self):
+        result = choose_head(
+            (10, 10), .7, (100, 100), .9,
+            reflection_source="reflection_model_disagrees")
+        self.assertIn("model_disagrees", result.source)
+
     def test_reflection_model_replaces_disagreeing_heuristic_when_confident(self):
         result = choose_reflection((100, 100), .8, (10, 10), .7)
         self.assertEqual(result.source, "reflection_model_disagrees")

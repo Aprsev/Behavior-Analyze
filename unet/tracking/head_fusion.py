@@ -52,7 +52,8 @@ def choose_reflection(heuristic, heuristic_confidence: float,
 def choose_head(reflection, reflection_confidence: float,
                 learned, learned_confidence: float,
                 agreement_px: float = 18.0,
-                learned_threshold: float = 0.0) -> HeadChoice:
+                learned_threshold: float = 0.0,
+                reflection_source: str | None = None) -> HeadChoice:
     """Prefer the physical reflection; learned prediction only nudges/fills.
 
     A learned point can move a valid reflection by at most 15%, and only when
@@ -62,15 +63,21 @@ def choose_head(reflection, reflection_confidence: float,
     r = np.asarray(reflection, float) if reflection is not None else None
     l = np.asarray(learned, float) if learned is not None else None
     if r is not None and np.isfinite(r).all():
+        reflection_tag = (str(reflection_source).strip().lower()
+                          if reflection_source else "")
         disagreement = float(np.linalg.norm(l - r)) if l is not None and np.isfinite(l).all() else None
         if disagreement is not None and disagreement <= agreement_px and learned_confidence >= learned_threshold:
             weight = min(0.15, 0.15 * learned_confidence)
             point = (1.0 - weight) * r + weight * l
             return HeadChoice(tuple(map(float, point)),
                               float(max(reflection_confidence, learned_confidence * .5)),
-                              "fused_reflection_primary", disagreement)
+                              ("fused_reflection_primary_" + reflection_tag
+                               if reflection_tag else "fused_reflection_primary"),
+                              disagreement)
         return HeadChoice(tuple(map(float, r)), float(reflection_confidence),
-                          "reflection", disagreement)
+                          ("reflection_" + reflection_tag
+                           if reflection_tag else "reflection"),
+                          disagreement)
     if l is not None and np.isfinite(l).all() and learned_confidence >= learned_threshold:
         source = ("learned_fallback" if learned_confidence >= 0.20
                   else "learned_low_confidence_fallback")
@@ -105,7 +112,15 @@ class HeadTemporalStabilizer:
             return choice
         b = np.asarray(body, dtype=float)
         point = np.asarray(choice.point, dtype=float) if choice.point is not None else None
-        trusted = choice.source in {"manual_override", "reflection", "fused_reflection_primary"}
+        source = str(choice.source).lower()
+        trusted_reflection = (
+            "reflection" in source
+            and "confirmed" in source
+            and "missing" not in source
+            and "absent" not in source
+            and "disagrees" not in source
+        )
+        trusted = choice.source in {"manual_override"} or trusted_reflection
         if point is not None and np.isfinite(point).all():
             observed_relative = point - b
             if trusted or self.relative is None:

@@ -1,5 +1,32 @@
 # U-Net mouse / miniscope segmentation
 
+## Source tree
+
+The implementation is grouped by responsibility. Files kept directly under
+`unet/` are deliberately tiny compatibility launchers, so existing commands
+such as `python unet/head_track.py ...` and GUI subprocess calls remain valid.
+New Python code should be added to the corresponding package instead of the
+top-level directory.
+
+```text
+unet/
+├── core/                 model, preprocessing, postprocessing, calibration, label I/O
+├── tracking/             head/reflection fusion and anatomical constraints
+├── training/             dataset export, training, checkpoint calibration
+├── inference/            mask inference and full body/head trajectory analysis
+├── annotation/           screening and interactive label editors
+├── gui/                  desktop workbench and paginated annotation gallery
+├── tools/                ROI creation and label migration
+├── tests/                regression tests
+├── run_unet.py           workflow orchestrator
+├── ui.py                 backward-compatible GUI launcher
+└── other top-level *.py  backward-compatible CLI launchers
+```
+
+Internal modules use package-qualified imports (for example
+`core.model`, `tracking.head_fusion`, and `annotation.edit_polygon_label`).
+The supported user-facing commands below have not changed.
+
 This is the GPU-oriented CNN path. It replaces dark-background segmentation
 with a supervised pixel classifier. The initial release trains a **binary**
 mask: `mouse + head-mounted miniscope = 1`; `fibre + tail + arena = 0`.
@@ -64,6 +91,37 @@ are accepted as positive masks. Draw them tightly around mouse plus miniscope,
 and explicitly exclude fibre/tail.
 
 ## Multi-video workflow (recommended)
+
+### Add a finished new video and continue training
+
+After **一键完整分析** has produced `head_track_trajectory.csv`,
+`mouse_miniscope_mask.mp4`, and the overlay video, click
+**加入训练并继续微调** on the analysis tab.
+
+The review window deliberately does not add the whole video:
+
+1. **small_mask** scans the complete mask video in a worker thread and compares
+   every positive mask area with a robust per-video median. The slider changes
+   the cutoff (for example, 65% means “show masks smaller than 65% of normal”)
+   and refreshes the paginated 4 × 3 montage immediately.
+2. **head_opposite** shows frames where the Head→centroid and
+   Reflection→centroid vectors point to opposite sides. Near-duplicate adjacent
+   frames are suppressed.
+3. **开始逐张修改** opens the selected queue. Body candidates start from the
+   current U-Net contour simplified to eight vertices. Head candidates allow
+   Head and Reflection to be moved independently.
+4. In either editor, **S saves and advances**. Navigation without dragging,
+   confirming, deleting, or excluding a point does not create a label.
+5. **完成复查并开始增量训练** is enabled logically only when this review
+   session created at least one correction. The current video's corrected
+   samples are exported into the existing shared dataset and training resumes
+   from the selected checkpoint.
+
+Training still uses the candidate/promotion audit in `training/train.py`.
+The selected checkpoint is used as `--base-model`; a timestamped candidate is
+written and the original `.pt` file is never overwritten. The GUI refuses
+incremental training when the original `dataset.json` is unavailable, because
+fine-tuning on only one new video would risk catastrophic forgetting.
 
 `unet/run_unet.py` is the one-command launcher. The `VIDEOS` list at the top
 of the file defines every recording that will contribute to training; all

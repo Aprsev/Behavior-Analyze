@@ -7,7 +7,7 @@ import math
 import cv2
 import numpy as np
 
-from head_fusion import HeadChoice
+from tracking.head_fusion import HeadChoice
 
 
 @dataclass
@@ -174,6 +174,7 @@ class AnatomicalHeadConstraint:
 
         candidate_index = None
         reflection_direction_cue = False
+        reflection_level = 0
         if candidate is not None:
             candidate_index = int(np.argmin([
                 math.hypot(float(candidate[0] - point[0]), float(candidate[1] - point[1]))
@@ -183,17 +184,26 @@ class AnatomicalHeadConstraint:
             reflection_direction_cue = (
                 "reflection" in choice.source and outside_distance <= 3.0 and
                 candidate_axial_distance >= 0.12 * major_length)
+            source_lower = str(choice.source).lower()
+            if reflection_direction_cue:
+                if ("manual" in source_lower or
+                        ("fused_reflection_primary" in source_lower and
+                         "disagrees" not in source_lower)):
+                    reflection_level = 2
+                elif ("disagrees" not in source_lower and
+                      choice.confidence >= 0.20):
+                    reflection_level = 1
 
         tail_head_index = 1 - tail_index if tail_index is not None else None
-        reflection_tail_consensus = (tail_head_index is not None and
-                                     reflection_direction_cue and
-                                     candidate_index == tail_head_index)
-        if tail_head_index is not None:
-            # A contained tail disagrees with a Reflection on the same side:
-            # treat that spot as a tail/fibre false positive.
-            head_index = tail_head_index
-        elif reflection_direction_cue:
+        if reflection_direction_cue and (
+                reflection_level >= 2 or tail_head_index is None or
+                self.previous_direction is not None):
+            # Reliable reflections can immediately determine the head half.
+            # A single medium/low-quality point must accumulate temporal votes,
+            # especially when it conflicts with a possible tail.
             head_index = candidate_index
+        elif tail_head_index is not None:
+            head_index = tail_head_index
         elif self.previous_direction is not None:
             head_index = int(np.argmax([float(np.dot(direction, self.previous_direction))
                                         for direction in directions]))
@@ -205,8 +215,11 @@ class AnatomicalHeadConstraint:
         proposed_direction = directions[head_index]
         if self.previous_direction is not None and np.dot(proposed_direction, self.previous_direction) < 0:
             self.flip_votes += 1
-            required_votes = (1 if reflection_tail_consensus else
-                              2 if reflection_direction_cue else self.flip_confirm_frames)
+            required_votes = (
+                1 if reflection_level >= 2 else
+                2 if reflection_level == 1 else
+                self.flip_confirm_frames
+            )
             if self.flip_votes < required_votes:
                 head_index = int(np.argmax([float(np.dot(direction, self.previous_direction))
                                             for direction in directions]))
@@ -214,6 +227,8 @@ class AnatomicalHeadConstraint:
         else:
             self.flip_votes = 0
 
+        reflection_confirmed = (
+            reflection_direction_cue and candidate_index == head_index)
         head_endpoint = endpoints[head_index]
         if elongation >= self.elongated_ratio:
             wrong_half = (candidate is not None and
@@ -225,12 +240,16 @@ class AnatomicalHeadConstraint:
                 source = "anatomical_endpoint_" + choice.source
                 confidence = min(0.65, max(0.12, choice.confidence * 0.75))
             else:
-                source = ("anatomical_clamped_" if outside_distance else "anatomical_") + choice.source
+                prefix = ("anatomical_confirmed_" if reflection_confirmed else
+                          "anatomical_clamped_" if outside_distance else "anatomical_")
+                source = prefix + choice.source
                 confidence = choice.confidence * (0.75 if outside_distance else 1.0)
         else:
             if candidate is None:
                 return AnatomyResult(choice, elongation, tail_detected, corrected, outside_distance)
-            source = ("anatomical_clamped_" if outside_distance else "anatomical_") + choice.source
+            prefix = ("anatomical_confirmed_" if reflection_confirmed else
+                      "anatomical_clamped_" if outside_distance else "anatomical_")
+            source = prefix + choice.source
             confidence = choice.confidence * (0.75 if outside_distance else 1.0)
 
         self.previous_direction = proposed_direction if self.previous_direction is None else (

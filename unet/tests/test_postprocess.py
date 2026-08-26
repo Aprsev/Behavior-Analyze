@@ -5,7 +5,7 @@ import unittest
 import cv2
 import numpy as np
 
-from postprocess import TemporalMaskFilter
+from core.postprocess import TemporalMaskFilter
 
 
 def mouse_with_fibre(center=(80, 150), fibre_end=(230, 20)) -> np.ndarray:

@@ -4,7 +4,7 @@ import unittest
 
 try:
     import torch
-    from model import UNet, checkpoint_model, unpack_outputs
+    from core.model import UNet, checkpoint_model, unpack_outputs
 except ImportError:  # local CPU workstation may intentionally lack PyTorch
     torch = None
 
