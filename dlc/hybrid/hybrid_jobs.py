@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Public hybrid worker with supervised DLC project auto-discovery."""
+"""Public hybrid worker with verified extraction and compatible napari labeling."""
 
 from __future__ import annotations
 
@@ -7,42 +7,52 @@ import argparse
 import json
 from pathlib import Path
 import sys
-from typing import Callable
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from dlc.hybrid import _active_jobs_impl as _config
-from dlc.hybrid import _video_safe_jobs as _base
-from dlc.hybrid._video_safe_jobs import *  # noqa: E402,F401,F403
+from dlc.hybrid import _project_safe_jobs as _base
+from dlc.hybrid._project_safe_jobs import *  # noqa: E402,F401,F403
+from dlc.hybrid.labeling_data import choose_label_folder, extraction_summary
 from dlc.hybrid.project_config import resolve_project_config
 
-PROJECT_REQUIRED_ACTIONS = {
-    "add_videos", "extract_frames", "label_frames", "check_labels",
-    "build_dataset", "train", "evaluate", "analyze", "filter_predictions",
-    "create_labeled_video", "plot_trajectories", "extract_outliers",
-    "refine_labels", "merge_datasets",
-}
+
+def _emit_project(path: Path) -> None:
+    print(
+        "HYBRID_GUI_RESULT " + json.dumps({"project_config": str(path)}, ensure_ascii=False),
+        flush=True,
+    )
+    print(f"Using DLC project: {path}", flush=True)
 
 
-def _project_action(name: str) -> Callable[[dict], None]:
-    def run(cfg: dict) -> None:
-        path = resolve_project_config(cfg)
-        print(
-            "HYBRID_GUI_RESULT " + json.dumps({"project_config": str(path)}, ensure_ascii=False),
-            flush=True,
-        )
-        print(f"Using DLC project: {path}", flush=True)
-        _base.ALL_JOBS[name](cfg)
+def job_extract_frames(cfg: dict) -> None:
+    _base.ALL_JOBS["extract_frames"](cfg)
+    project = resolve_project_config(cfg)
+    print(extraction_summary(project), flush=True)
 
-    run.__name__ = getattr(_base.ALL_JOBS[name], "__name__", f"job_{name}")
-    return run
+
+def job_label_frames(cfg: dict) -> None:
+    project = resolve_project_config(cfg)
+    _emit_project(project)
+    selected, valid = choose_label_folder(project)
+    remaining = sum(not folder.has_collected_data for folder in valid)
+    print(
+        f"Opening napari folder: {selected.path} ({selected.image_count} images; "
+        f"{remaining} unlabeled folders remain)",
+        flush=True,
+    )
+    # Some DLC releases pass only the image folder, while current
+    # napari-deeplabcut expects the project config alongside a new image folder.
+    from deeplabcut.gui.widgets import launch_napari
+
+    launch_napari(files=[str(selected.path), str(project)])
 
 
 ALL_JOBS = dict(_base.ALL_JOBS)
-for _name in PROJECT_REQUIRED_ACTIONS.intersection(ALL_JOBS):
-    ALL_JOBS[_name] = _project_action(_name)
+ALL_JOBS["extract_frames"] = job_extract_frames
+ALL_JOBS["label_frames"] = job_label_frames
 
 
 def main() -> int:
