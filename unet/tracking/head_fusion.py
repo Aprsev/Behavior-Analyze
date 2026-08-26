@@ -35,6 +35,13 @@ def choose_reflection(heuristic, heuristic_confidence: float,
             return HeadChoice(tuple(map(float, point)),
                               float(max(learned_confidence, heuristic_confidence)),
                               "reflection_model_consensus", disagreement)
+        # On a new background the learned branch can be confidently attracted
+        # to the tail. A usable physical bright-spot observation is an
+        # independent sensor and wins a large disagreement; confidence from
+        # two spatially contradictory methods must not make the model primary.
+        if heuristic_confidence >= 0.12:
+            return HeadChoice(tuple(map(float, h)), float(heuristic_confidence),
+                              "reflection_heuristic_rejects_model", disagreement)
         if learned_confidence >= 0.20:
             return HeadChoice(tuple(map(float, l)), float(learned_confidence),
                               "reflection_model_disagrees", disagreement)

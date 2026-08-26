@@ -430,6 +430,12 @@ frame and `--motion-confirm-frames 2`. Increase either value if grooming or
 mask-centroid jitter causes false corrections; decrease the speed threshold
 only when genuine slow locomotion is not being corrected.
 
+For elongated silhouettes, automatic head points are additionally restricted
+to an anatomical end-cap. Peaks on the torso flank or around the centroid are
+moved to the selected major-axis endpoint. When the learned reflection and
+physical bright-spot tracker strongly disagree, a usable bright-spot detection
+is treated as an independent cue and takes priority over the network peak.
+
 Outputs in the inference folder:
 
 - `head_track_trajectory.csv` — `frame, timestamp_sec, body_x_cm, body_y_cm,

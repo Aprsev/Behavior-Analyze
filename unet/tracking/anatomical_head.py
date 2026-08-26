@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 import math
 
 import cv2
@@ -90,6 +91,7 @@ class AnatomicalHeadConstraint:
         self.previous_body: np.ndarray | None = None
         self.motion_velocity: np.ndarray | None = None
         self.motion_streak = 0
+        self.body_history: deque[np.ndarray] = deque(maxlen=7)
 
     def reset(self) -> None:
         self.previous_direction = None
@@ -97,6 +99,7 @@ class AnatomicalHeadConstraint:
         self.previous_body = None
         self.motion_velocity = None
         self.motion_streak = 0
+        self.body_history.clear()
 
     def _motion_direction(self, body: np.ndarray, major_length: float):
         """Return a conservative centroid-velocity direction and speed.
@@ -107,6 +110,7 @@ class AnatomicalHeadConstraint:
         """
         if self.previous_body is None:
             self.previous_body = body.copy()
+            self.body_history.append(body.copy())
             return None, 0.0
         delta = body - self.previous_body
         self.previous_body = body.copy()
@@ -114,9 +118,18 @@ class AnatomicalHeadConstraint:
         if instantaneous > max(10.0, 0.75 * major_length):
             self.motion_velocity = None
             self.motion_streak = 0
+            self.body_history.clear()
+            self.body_history.append(body.copy())
             return None, 0.0
+        self.body_history.append(body.copy())
+        # A multi-frame displacement is substantially less sensitive to mask
+        # centroid breathing than a single-frame delta. Keep the EMA as a
+        # fallback until enough history has accumulated.
         self.motion_velocity = (delta.copy() if self.motion_velocity is None else
                                 0.65 * self.motion_velocity + 0.35 * delta)
+        if len(self.body_history) >= 4:
+            span = self.body_history[-1] - self.body_history[0]
+            self.motion_velocity = span / max(len(self.body_history) - 1, 1)
         speed = float(np.linalg.norm(self.motion_velocity))
         if speed >= self.motion_min_speed:
             self.motion_streak += 1
@@ -296,10 +309,20 @@ class AnatomicalHeadConstraint:
             wrong_half = (candidate is not None and
                           float(np.dot(candidate - b, proposed_direction)) < -0.05 * major_length)
             far_outside = outside_distance > max(3.0, 0.12 * major_length)
-            if candidate is None or wrong_half or far_outside:
+            axial = (float(np.dot(candidate - b, proposed_direction))
+                     if candidate is not None else float("-inf"))
+            endpoint_distance = (float(np.linalg.norm(candidate - head_endpoint))
+                                 if candidate is not None else float("inf"))
+            # A head point on an elongated mouse must occupy an end-cap. A
+            # heatmap peak on the flank/torso can be on the correct half yet
+            # is still anatomically impossible as a head coordinate.
+            side_or_central = (axial < 0.18 * major_length or
+                               endpoint_distance > 0.42 * major_length)
+            if candidate is None or wrong_half or far_outside or side_or_central:
                 candidate = head_endpoint.copy()
                 corrected = True
-                source = "anatomical_endpoint_" + choice.source
+                source = (("anatomical_endcap_" if side_or_central and not wrong_half
+                           else "anatomical_endpoint_") + choice.source)
                 confidence = min(0.65, max(0.12, choice.confidence * 0.75))
             else:
                 prefix = ("anatomical_confirmed_" if reflection_confirmed else

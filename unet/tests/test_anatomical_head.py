@@ -104,6 +104,15 @@ class AnatomicalHeadTests(unittest.TestCase):
         result = tracker.update((100, 60), mask, mask, wrong)
         self.assertFalse(result.motion_corrected)
 
+    def test_side_peak_is_moved_to_anatomical_endcap(self):
+        mask = self.elongated_mask()
+        tracker = AnatomicalHeadConstraint()
+        result = tracker.update((90, 60), mask, mask,
+                                HeadChoice((105, 43), .9, "learned_fallback", None))
+        self.assertTrue(result.corrected)
+        self.assertGreater(result.choice.point[0], 120)
+        self.assertTrue(result.choice.source.startswith("anatomical_endcap_"))
+
 
 if __name__ == "__main__":
     unittest.main()
