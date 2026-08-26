@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Public hybrid worker with version-independent supervised frame extraction."""
+"""Public hybrid worker with synchronized supervised DLC training videos."""
 
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import sys
 
@@ -13,23 +12,16 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from dlc.hybrid import _active_jobs_impl as _config
-from dlc.hybrid import _synced_project_jobs as _base
-from dlc.hybrid._synced_project_jobs import *  # noqa: E402,F401,F403
-from dlc.hybrid.frame_extraction import extract_training_frames
-from dlc.hybrid.labeling_data import extraction_summary
+from dlc.hybrid import _napari_safe_jobs as _base
+from dlc.hybrid._napari_safe_jobs import *  # noqa: E402,F401,F403
 from dlc.hybrid.project_config import resolve_project_config
 from dlc.hybrid.project_videos import sync_training_videos
 
 
 def job_extract_frames(cfg: dict) -> None:
     project = resolve_project_config(cfg)
-    print(
-        "HYBRID_GUI_RESULT " + json.dumps({"project_config": str(project)}, ensure_ascii=False),
-        flush=True,
-    )
     sync_training_videos(cfg, project)
-    extract_training_frames(cfg, project)
-    print(extraction_summary(project), flush=True)
+    _base.ALL_JOBS["extract_frames"](cfg)
 
 
 ALL_JOBS = dict(_base.ALL_JOBS)
