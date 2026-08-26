@@ -25,6 +25,8 @@ import pandas as pd
 UNET = Path(__file__).resolve().parents[2] / 'unet'
 sys.path.insert(0, str(UNET))
 from core.label_compat import as_bool, normalize_polygon, video_mask  # noqa: E402
+from annotation.similarity_propagation import (  # noqa: E402
+    read_frame, similar_candidate_neighbors, translate_polygon_optical_flow)
 from mouse_behavior_pipeline import (
     perspective_geometry, robust_threshold, sample_frames, segment_mouse, video_properties,
 )
@@ -201,6 +203,9 @@ def main() -> None:
                    help='optional mask video used as the initial editable U-Net contour')
     p.add_argument('--only-modified', action='store_true',
                    help='write only frames whose polygon was actually edited')
+    p.add_argument('--propagate-similarity', type=float, default=0.0,
+                   help='auto-propagate a manual edit to adjacent candidates above this similarity')
+    p.add_argument('--propagate-window', type=int, default=15)
     p.add_argument('--review-existing', action='store_true',
                    help='review and overwrite existing labels for this video instead of selecting new frames')
     args=p.parse_args()
@@ -237,7 +242,8 @@ def main() -> None:
     if not args.review_existing:
         print(f'{Path(args.input).name}: {len(labels)} frames already labelled, '
               f'{len(frames)} NEW unlabelled frames to label (max {args.max_labels} per run).')
-    state={'i':0,'points':None,'drag':None,'dirty':False,'touched':set()}
+    state={'i':0,'points':None,'drag':None,'dirty':False,'touched':set(),
+           'propagated':0}
     def frame_image(frame):
         cap.set(cv2.CAP_PROP_POS_FRAMES,frame); ok,img=cap.read()
         if not ok: raise RuntimeError(f'Cannot read frame {frame}')
@@ -288,9 +294,39 @@ def main() -> None:
             'frame': frame,
             'polygon_px': json.dumps(np.asarray(state['points']).round(1).tolist()),
             'exclude': excluded,
+            'source': 'incremental_small_mask_correction' if args.only_modified else 'torso_constraint',
         })
         state['touched'].add(frame); state['dirty']=False
+        propagate(frame, np.asarray(state['points']).copy())
         return True
+    def propagate(anchor_frame, polygon):
+        if not args.only_modified or args.propagate_similarity <= 0:
+            return
+        neighbors=similar_candidate_neighbors(
+            cap,anchor_frame,set(frames),args.propagate_similarity,args.propagate_window)
+        source=read_frame(cap,anchor_frame)
+        if source is None: return
+        added=0
+        for target_frame,similarity in neighbors:
+            if target_frame in state['touched']: continue
+            # Never overwrite an existing human label. Propagated rows may be
+            # replaced when a later, better manual anchor reaches them.
+            existing=labels.get(target_frame)
+            if existing is not None and 'similarity_propagated' not in str(existing.get('source','')):
+                continue
+            target=read_frame(cap,target_frame)
+            if target is None: continue
+            moved=translate_polygon_optical_flow(source,target,polygon)
+            if moved is None: continue
+            labels[target_frame]=pd.Series({
+                'frame':target_frame,
+                'polygon_px':json.dumps(moved.round(1).tolist()),
+                'exclude':False,
+                'source':f'incremental_similarity_propagated_{similarity:.3f}'})
+            state['touched'].add(target_frame); added+=1
+        state['propagated']+=added
+        if added:
+            print(f'Frame {anchor_frame}: propagated polygon correction to {added} similar frames')
     def nearest(x,y):
         distance=np.linalg.norm(state['points']-np.asarray([x,y]),axis=1)
         return int(distance.argmin()),float(distance.min())
@@ -314,7 +350,9 @@ def main() -> None:
         selected=(state['touched'] if args.only_modified else labels.keys())
         for frame in selected:
             row=labels[frame]
-            rows.append({'frame':frame,'polygon_px':row.polygon_px,'exclude':as_bool(row.exclude),'video':Path(args.input).name,'source':'incremental_small_mask_correction' if args.only_modified else 'torso_constraint'})
+            rows.append({'frame':frame,'polygon_px':row.polygon_px,
+                         'exclude':as_bool(row.exclude),'video':Path(args.input).name,
+                         'source':row.get('source','incremental_small_mask_correction' if args.only_modified else 'torso_constraint')})
         if not rows:
             print('No polygon was modified; no training label was added.')
             return
@@ -336,7 +374,7 @@ def main() -> None:
         cv2.rectangle(img,(0,0),(img.shape[1],47),(0,0,0),-1)
         excluded_flag = bool(labels.get(frame) is not None and as_bool(labels[frame].exclude))
         status = ' [EXCLUDED]' if excluded_flag else ''
-        cv2.putText(img,f'{state["i"]+1}/{len(frames)} frame={frame}{status}: automatic body contour; adjust only fibre/tail-affected vertices',(8,19),cv2.FONT_HERSHEY_SIMPLEX,.43,(0,0,255) if excluded_flag else (255,255,255),1)
+        cv2.putText(img,f'{state["i"]+1}/{len(frames)} frame={frame}{status}: automatic body contour; propagated={state["propagated"]}',(8,19),cv2.FONT_HERSHEY_SIMPLEX,.43,(0,0,255) if excluded_flag else (255,255,255),1)
         cv2.putText(img,'Drag vertex / click edge add  Backspace delete  R recalc  T thin(8pts)  E discard  A/D step  S save  Q quit',(8,39),cv2.FONT_HERSHEY_SIMPLEX,.37,(255,255,255),1)
         cv2.imshow(title,img); k=cv2.waitKey(20)&255
         if k in (27,ord('q')): save(); break

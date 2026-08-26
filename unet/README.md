@@ -112,6 +112,14 @@ The review window deliberately does not add the whole video:
    Head and Reflection to be moved independently.
 4. In either editor, **S saves and advances**. Navigation without dragging,
    confirming, deleting, or excluding a point does not create a label.
+   The review toolbar also controls conservative similar-frame propagation:
+   the default is 97% appearance similarity within ±15 frames. Starting from
+   a manual anchor, each direction is scanned sequentially and propagation
+   stops at the first dissimilar frame. Body polygons follow the median
+   Lucas–Kanade optical-flow displacement; Head/Reflection corrections reuse
+   the manual offset from that frame's automatic prediction. Existing manual
+   labels are never overwritten, and propagated rows retain an explicit
+   `incremental_similarity_propagated_*` source.
 5. **完成复查并开始增量训练** is enabled logically only when this review
    session created at least one correction. The current video's corrected
    samples are exported into the existing shared dataset and training resumes

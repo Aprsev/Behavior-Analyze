@@ -18,6 +18,7 @@ from mouse_behavior_pipeline import perspective_geometry, video_properties  # no
 from annotation.edit_polygon_label import create_editor_window, window_is_visible  # noqa: E402
 from core.label_compat import (as_bool, atomic_upsert_head, atomic_upsert_polygon,
                           video_mask)  # noqa: E402
+from annotation.similarity_propagation import similar_candidate_neighbors  # noqa: E402
 
 
 def rot_pt(point, k: int, height: int, width: int):
@@ -60,10 +61,13 @@ def main() -> None:
                    help="optional incremental-review CSV; uses head_opposite rows exactly")
     p.add_argument("--only-modified", action="store_true",
                    help="save only frames whose head/reflection was manually changed")
+    p.add_argument("--propagate-similarity", type=float, default=0.0)
+    p.add_argument("--propagate-window", type=int, default=15)
     a = p.parse_args()
 
     data = pd.read_csv(a.trajectory).drop_duplicates("frame", keep="last").set_index("frame", drop=False)
     existing = set()
+    protected_head_frames: set[int] = set()
     if Path(a.heads).is_file():
         old = pd.read_csv(a.heads)
         if "video" in old:
@@ -73,6 +77,9 @@ def main() -> None:
                              if "head_verified" in old else pd.Series(False, index=old.index))
             reflection_verified = (old["reflection_verified"].map(as_bool)
                                    if "reflection_verified" in old else pd.Series(False, index=old.index))
+            protected_head_frames = set(pd.to_numeric(
+                old.loc[head_verified | reflection_verified, "frame"],
+                errors="coerce").dropna().astype(int))
             fully_verified = head_verified & reflection_verified
             existing = set(pd.to_numeric(old.loc[fully_verified, "frame"], errors="coerce")
                            .dropna().astype(int))
@@ -95,6 +102,16 @@ def main() -> None:
     corners = np.asarray(roi["arena_corners_px"], np.float32)
     cap = cv2.VideoCapture(a.video)
     mask_cap = cv2.VideoCapture(a.mask_video) if a.mask_video and Path(a.mask_video).is_file() else None
+    torso_existing: set[int] = set()
+    if a.torso_labels and Path(a.torso_labels).is_file():
+        try:
+            torso_rows = pd.read_csv(a.torso_labels)
+            if "video" in torso_rows:
+                torso_rows = torso_rows.loc[video_mask(torso_rows.video, Path(a.video).name)]
+            torso_existing = set(pd.to_numeric(
+                torso_rows.get("frame"), errors="coerce").dropna().astype(int))
+        except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError):
+            torso_existing = set()
     width, height = int(cap.get(3)), int(cap.get(4))
     total, fps, _, _ = video_properties(Path(a.video))
     k = a.rotate // 90 % 4
@@ -105,7 +122,9 @@ def main() -> None:
     state = {"i": 0, "active": "head", "head": None, "reflection": None,
              "drag": False, "exclude": False, "saved": 0,
              "head_verified": False, "reflection_verified": False,
-             "dirty": False}
+             "dirty": False, "head_dirty": False,
+             "reflection_dirty": False, "propagated": 0,
+             "original_head": None, "original_reflection": None}
     title = "Head result correction"
 
     def cm_to_px(point):
@@ -132,6 +151,10 @@ def main() -> None:
         state["head_verified"] = False
         state["reflection_verified"] = False
         state["dirty"] = False
+        state["head_dirty"] = False
+        state["reflection_dirty"] = False
+        state["original_head"] = state["head"]
+        state["original_reflection"] = state["reflection"]
 
     def frame_image():
         frame = frames[state["i"]]
@@ -148,11 +171,88 @@ def main() -> None:
                 pxy = tuple(np.rint(point).astype(int)); cv2.circle(image, pxy, 8, color, -1, cv2.LINE_AA)
                 cv2.putText(image, label, (pxy[0] + 9, pxy[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1)
         cv2.rectangle(image, (0, 0), (image.shape[1], 58), (0, 0, 0), -1)
-        cv2.putText(image, f"{state['i']+1}/{len(frames)} frame={frame} source={row.get('head_source','?')} active={state['active'].upper()}",
+        cv2.putText(image, f"{state['i']+1}/{len(frames)} frame={frame} source={row.get('head_source','?')} active={state['active'].upper()} propagated={state['propagated']}",
                     (8, 21), cv2.FONT_HERSHEY_SIMPLEX, .48, (255, 255, 255), 1)
         cv2.putText(image, "H/R select  drag=verify  C confirm point  X reflection absent  N head absent  E exclude  A/D  S save+next  Q quit",
                     (8, 45), cv2.FONT_HERSHEY_SIMPLEX, .37, (255, 255, 255), 1)
         return image
+
+    def predicted_point(row, prefix):
+        x = pd.to_numeric(row.get(f"{prefix}_x_cm"), errors="coerce")
+        y = pd.to_numeric(row.get(f"{prefix}_y_cm"), errors="coerce")
+        return np.asarray([x, y], float) if np.isfinite([x, y]).all() else None
+
+    def snapshot_mask(frame: int, source: str) -> None:
+        if mask_cap is None or not a.torso_labels or frame in torso_existing:
+            return
+        mask_cap.set(cv2.CAP_PROP_POS_FRAMES, frame); ok, mask_frame = mask_cap.read()
+        if not ok:
+            return
+        gray = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
+        contours, _ = cv2.findContours((gray > 127).astype(np.uint8),
+                                       cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return
+        contour = max(contours, key=cv2.contourArea)
+        polygon = cv2.approxPolyDP(
+            contour, .005 * cv2.arcLength(contour, True), True).reshape(-1, 2)
+        atomic_upsert_polygon(a.torso_labels, a.video, frame, polygon,
+                              False, source)
+        torso_existing.add(frame)
+
+    def propagate(anchor_frame: int) -> None:
+        if a.propagate_similarity <= 0:
+            return
+        corrections = {}
+        for prefix in ("head", "reflection"):
+            if not state[f"{prefix}_dirty"]:
+                continue
+            original = state[f"original_{prefix}"]
+            corrected = state[prefix]
+            if corrected is None:
+                corrections[prefix] = None
+            elif original is not None and np.isfinite(original).all():
+                corrections[prefix] = np.asarray(corrected, float) - np.asarray(original, float)
+        if not corrections:
+            return
+        neighbors = similar_candidate_neighbors(
+            cap, anchor_frame, set(frames), a.propagate_similarity,
+            a.propagate_window)
+        added = 0
+        for target_frame, similarity in neighbors:
+            if (target_frame == anchor_frame or target_frame in existing or
+                    target_frame in protected_head_frames):
+                continue
+            row = data.loc[target_frame]
+            values = {}
+            verified = {}
+            for prefix in ("head", "reflection"):
+                base = predicted_point(row, prefix)
+                if prefix not in corrections:
+                    values[prefix] = tuple(base) if base is not None else None
+                    verified[prefix] = False
+                elif corrections[prefix] is None:
+                    values[prefix] = None
+                    verified[prefix] = True
+                elif base is not None:
+                    values[prefix] = tuple(base + corrections[prefix])
+                    verified[prefix] = True
+                else:
+                    values[prefix] = None
+                    verified[prefix] = False
+            if not any(verified.values()):
+                continue
+            atomic_upsert_head(
+                a.heads, a.video, target_frame, target_frame / fps,
+                values["head"], values["reflection"], False,
+                source=f"incremental_similarity_propagated_{similarity:.3f}",
+                head_verified=verified["head"],
+                reflection_verified=verified["reflection"])
+            snapshot_mask(target_frame, "head_similarity_support_mask")
+            existing.add(target_frame); added += 1
+        state["propagated"] += added
+        if added:
+            print(f"Frame {anchor_frame}: propagated keypoint correction to {added} similar frames")
 
     def save():
         if a.only_modified and not state["dirty"]:
@@ -166,17 +266,8 @@ def main() -> None:
         # The green mask has already been accepted as accurate. Snapshot it as
         # this frame's torso label so every newly corrected head point is
         # actually exportable as a supervised heatmap during the next rebuild.
-        if mask_cap is not None and a.torso_labels:
-            mask_cap.set(cv2.CAP_PROP_POS_FRAMES, frame); ok, mask_frame = mask_cap.read()
-            if ok:
-                gray = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
-                contours, _ = cv2.findContours((gray > 127).astype(np.uint8),
-                                               cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if contours:
-                    contour = max(contours, key=cv2.contourArea)
-                    polygon = cv2.approxPolyDP(contour, .005 * cv2.arcLength(contour, True), True).reshape(-1, 2)
-                    atomic_upsert_polygon(a.torso_labels, a.video, frame, polygon,
-                                          state["exclude"], "head_result_mask_snapshot")
+        snapshot_mask(frame, "head_result_mask_snapshot")
+        propagate(frame)
         state["saved"] += 1
         state["dirty"] = False
         return True
@@ -186,6 +277,7 @@ def main() -> None:
             state["drag"] = True; state[state["active"]] = px_to_cm((x, y))
             state[state["active"] + "_verified"] = True
             state["dirty"] = True
+            state[state["active"] + "_dirty"] = True
         elif event == cv2.EVENT_MOUSEMOVE and state["drag"]:
             state[state["active"]] = px_to_cm((x, y))
         elif event == cv2.EVENT_LBUTTONUP:
@@ -202,10 +294,13 @@ def main() -> None:
         elif key == ord("r"): state["active"] = "reflection"
         elif key == ord("c"):
             state[state["active"] + "_verified"] = True; state["dirty"] = True
+            state[state["active"] + "_dirty"] = True
         elif key == ord("x"):
             state["reflection"] = None; state["reflection_verified"] = True; state["dirty"] = True
+            state["reflection_dirty"] = True
         elif key == ord("n"):
             state["head"] = None; state["head_verified"] = True; state["dirty"] = True
+            state["head_dirty"] = True
         elif key == ord("e"):
             state["exclude"] = not state["exclude"]; state["dirty"] = True
         elif key == ord("s"):

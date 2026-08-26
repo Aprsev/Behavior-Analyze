@@ -39,6 +39,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--rotate", type=int, default=0)
     p.add_argument("--max-candidates", type=int, default=200)
     p.add_argument("--initial-small-ratio", type=float, default=.65)
+    p.add_argument("--initial-propagate-similarity", type=float, default=.97)
+    p.add_argument("--initial-propagate-window", type=int, default=15)
     return p
 
 
@@ -86,6 +88,9 @@ class Review:
             opposite_head_frames(self.trajectory), args.max_candidates)
         self.mode = tk.StringVar(value="small_mask")
         self.ratio = tk.DoubleVar(value=float(args.initial_small_ratio))
+        self.propagate_similarity = tk.DoubleVar(
+            value=float(args.initial_propagate_similarity))
+        self.propagate_window = tk.IntVar(value=int(args.initial_propagate_window))
         self.status = tk.StringVar(value="正在后台扫描 Mask 面积…")
         self.progress_text = tk.StringVar(value="")
         self.page = 0
@@ -119,6 +124,20 @@ class Review:
         self.edit_button = ttk.Button(bar, text="开始逐张修改", command=self.edit_current)
         self.edit_button.pack(side="right", padx=5)
 
+        propagation = ttk.Frame(self.root); propagation.pack(fill="x", padx=10, pady=(0, 5))
+        ttk.Label(propagation, text="相似帧自动传播阈值").pack(side="left")
+        ttk.Scale(
+            propagation, from_=.85, to=.995, variable=self.propagate_similarity,
+            command=lambda _value: self._refresh_propagation_label()
+        ).pack(side="left", fill="x", expand=True, padx=5)
+        self.propagation_label = ttk.Label(propagation, width=7)
+        self.propagation_label.pack(side="left")
+        ttk.Label(propagation, text="前后窗口").pack(side="left", padx=(15, 3))
+        ttk.Spinbox(propagation, from_=1, to=120, textvariable=self.propagate_window,
+                    width=6).pack(side="left")
+        ttk.Label(propagation, text="帧；相似度下降即停止传播",
+                  foreground="#666").pack(side="left", padx=5)
+
         info = ttk.Frame(self.root); info.pack(fill="x", padx=12)
         ttk.Label(info, textvariable=self.status, foreground="#185a8d").pack(side="left")
         ttk.Label(info, textvariable=self.progress_text, foreground="#176b3a").pack(side="right")
@@ -133,6 +152,7 @@ class Review:
         ttk.Label(nav, text="只有拖动/确认过的帧会写入训练标签",
                   foreground="#8a4a00").pack(side="right", padx=12)
         self._refresh_ratio_label()
+        self._refresh_propagation_label()
 
     def _scan_masks(self) -> None:
         cap = cv2.VideoCapture(str(self.args.mask_video))
@@ -168,6 +188,10 @@ class Review:
 
     def _refresh_ratio_label(self) -> None:
         self.ratio_label.configure(text=f"{100*self.ratio.get():.0f}%")
+
+    def _refresh_propagation_label(self) -> None:
+        self.propagation_label.configure(
+            text=f"{100*self.propagate_similarity.get():.1f}%")
 
     def recalculate(self) -> None:
         self.pending_refresh = None
@@ -216,7 +240,9 @@ class Review:
             source = data.get("source", pd.Series("", index=data.index)).astype(str)
             wanted = ("incremental_small_mask" if label_type == "small_mask"
                       else "incremental_head_reflection")
-            return set(pd.to_numeric(data.loc[source.str.contains(wanted, na=False), "frame"],
+            accepted = (source.str.contains(wanted, na=False) |
+                        source.str.contains("incremental_similarity_propagated", na=False))
+            return set(pd.to_numeric(data.loc[accepted, "frame"],
                                      errors="coerce").dropna().astype(int))
         except (OSError, KeyError, pd.errors.ParserError, pd.errors.EmptyDataError):
             return set()
@@ -280,7 +306,9 @@ class Review:
                 "--arena-height-cm", str(self.args.arena_height_cm),
                 "--max-labels", str(self.args.max_candidates),
                 "--mask-video", self.args.mask_video,
-                "--candidate-csv", self.args.candidate_csv, "--only-modified"]
+                "--candidate-csv", self.args.candidate_csv, "--only-modified",
+                "--propagate-similarity", str(self.propagate_similarity.get()),
+                "--propagate-window", str(self.propagate_window.get())]
         else:
             command = [
                 sys.executable, str(UNET_ROOT / "annotate_head_results.py"),
@@ -291,7 +319,9 @@ class Review:
                 "--arena-height-cm", str(self.args.arena_height_cm),
                 "--max-labels", str(self.args.max_candidates),
                 "--rotate", str(self.args.rotate),
-                "--candidate-csv", self.args.candidate_csv, "--only-modified"]
+                "--candidate-csv", self.args.candidate_csv, "--only-modified",
+                "--propagate-similarity", str(self.propagate_similarity.get()),
+                "--propagate-window", str(self.propagate_window.get())]
         self.editor_running = True; self.edit_button.configure(state="disabled")
         self.status.set("编辑器运行中：S 保存并切换下一张；关闭后拼接页会刷新")
 
@@ -314,6 +344,8 @@ class Review:
             return
         session = {
             "video": str(self.video.resolve()), "small_mask_ratio": self.ratio.get(),
+            "propagate_similarity": self.propagate_similarity.get(),
+            "propagate_window": self.propagate_window.get(),
             "torso_frames": sorted(torso), "head_frames": sorted(heads),
             "candidate_csv": str(Path(self.args.candidate_csv).resolve())}
         path = Path(self.args.session_json); path.parent.mkdir(parents=True, exist_ok=True)
