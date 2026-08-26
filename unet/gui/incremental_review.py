@@ -307,6 +307,7 @@ class Review:
                 "--max-labels", str(self.args.max_candidates),
                 "--mask-video", self.args.mask_video,
                 "--candidate-csv", self.args.candidate_csv, "--only-modified",
+                "--candidate-type", "small_mask",
                 "--propagate-similarity", str(self.propagate_similarity.get()),
                 "--propagate-window", str(self.propagate_window.get())]
         else:

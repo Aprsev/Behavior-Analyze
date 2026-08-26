@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse, json, sys
 from pathlib import Path
 import shutil
+import traceback
 import cv2
 import numpy as np
 import pandas as pd
@@ -126,6 +127,8 @@ def _select_frames(args, labels: dict, cap: cv2.VideoCapture, total: int,
                              f'Run screening first: python unet/run_unet.py screen')
         cand = pd.read_csv(args.candidate_csv)
         cand = cand.loc[video_mask(cand.video, Path(args.input).name)]
+        if getattr(args, 'candidate_type', '') and 'candidate_type' in cand:
+            cand = cand.loc[cand.candidate_type == args.candidate_type]
         if not len(cand):
             raise SystemExit(f'No screening rows for {Path(args.input).name}.\n'
                              f'Run screening first: python unet/run_unet.py screen')
@@ -199,6 +202,8 @@ def main() -> None:
     p.add_argument('--roi-json',required=True); p.add_argument('--output',required=True)
     p.add_argument('--arena-width-cm',type=float,required=True); p.add_argument('--arena-height-cm',type=float,required=True)
     p.add_argument('--max-labels',type=int,default=50); p.add_argument('--candidate-csv',default='')
+    p.add_argument('--candidate-type', default='',
+                   help='optional candidate_type value to select from a shared review CSV')
     p.add_argument('--mask-video', default='',
                    help='optional mask video used as the initial editable U-Net contour')
     p.add_argument('--only-modified', action='store_true',
@@ -243,7 +248,7 @@ def main() -> None:
         print(f'{Path(args.input).name}: {len(labels)} frames already labelled, '
               f'{len(frames)} NEW unlabelled frames to label (max {args.max_labels} per run).')
     state={'i':0,'points':None,'drag':None,'dirty':False,'touched':set(),
-           'propagated':0}
+           'propagated':0,'error':''}
     def frame_image(frame):
         cap.set(cv2.CAP_PROP_POS_FRAMES,frame); ok,img=cap.read()
         if not ok: raise RuntimeError(f'Cannot read frame {frame}')
@@ -360,13 +365,22 @@ def main() -> None:
         # (video, frame) rows; every other video's annotations are kept.
         merge_labels(Path(args.output), Path(args.input).name, rows)
         merge_annotation_exclusions(args.candidate_csv, Path(args.input).name, rows)
+        state['error']=''
+        return True
     cv2.namedWindow(title,cv2.WINDOW_NORMAL); cv2.setMouseCallback(title,mouse); load()
     while True:
         # Closing the window with X must SAVE, not discard: otherwise the
         # whole session's labels exist only in memory and reappear as
         # "unlabelled" on the next run (the classic re-annotate bug).
-        if cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1:
-            save(); print('Window closed - annotations saved.')
+        try:
+            visible=cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) >= 1
+        except cv2.error:
+            visible=False
+        if not visible:
+            try: save()
+            except Exception:
+                traceback.print_exc()
+            print('Window closed - annotations saved.')
             break
         frame=frames[state['i']]; img=frame_image(frame); pts=state['points'].astype(np.int32)
         cv2.polylines(img,[pts],True,(255,255,0),2,cv2.LINE_AA)
@@ -375,13 +389,23 @@ def main() -> None:
         excluded_flag = bool(labels.get(frame) is not None and as_bool(labels[frame].exclude))
         status = ' [EXCLUDED]' if excluded_flag else ''
         cv2.putText(img,f'{state["i"]+1}/{len(frames)} frame={frame}{status}: automatic body contour; propagated={state["propagated"]}',(8,19),cv2.FONT_HERSHEY_SIMPLEX,.43,(0,0,255) if excluded_flag else (255,255,255),1)
-        cv2.putText(img,'Drag vertex / click edge add  Backspace delete  R recalc  T thin(8pts)  E discard  A/D step  S save  Q quit',(8,39),cv2.FONT_HERSHEY_SIMPLEX,.37,(255,255,255),1)
+        instruction=('SAVE ERROR: '+state['error'] if state['error'] else
+                     'Drag/click  T thin(8pts)  E discard  A/D step  S save+next  Q quit')
+        cv2.putText(img,instruction[:125],(8,39),cv2.FONT_HERSHEY_SIMPLEX,.37,
+                    (0,0,255) if state['error'] else (255,255,255),1)
         cv2.imshow(title,img); k=cv2.waitKey(20)&255
         if k in (27,ord('q')): save(); break
         if k==ord('s'):
-            save()
+            try:
+                save()
+            except Exception as exc:
+                state['error']=str(exc)
+                traceback.print_exc()
+                continue
             if state['i'] < len(frames)-1:
                 state['i'] += 1; load()
+            else:
+                state['error']='LAST FRAME SAVED - Q closes; A reviews previous frame'
         elif k==ord('r'): state['points']=auto_polygon(frame); state['dirty']=True
         elif k==ord('t'): state['points']=simplify(np.asarray(state['points']),8); state['dirty']=True
         elif k in (8,127) and len(state['points'])>3:
