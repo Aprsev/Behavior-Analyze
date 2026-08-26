@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hybrid worker with super-resolution model preflight and auto-discovery."""
+"""Public hybrid worker with SR, DLC, and video-integrity safeguards."""
 
 from __future__ import annotations
 
@@ -13,25 +13,54 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from dlc.hybrid import _active_jobs_impl as _config
-from dlc.hybrid import _quiet_validation_jobs as _base
-from dlc.hybrid._quiet_validation_jobs import *  # noqa: E402,F401,F403
-from dlc.hybrid.sr_model import resolve_super_resolution_model
+from dlc.hybrid import _hybrid_jobs_impl as _original
+from dlc.hybrid import _sr_preflight_jobs as _base
+from dlc.hybrid._sr_preflight_jobs import *  # noqa: E402,F401,F403
+from dlc.hybrid.dlc_runtime import validate_video_adaptation
+from dlc.hybrid.stable_video import prepare_hybrid_video_stable
+from dlc.hybrid.tolerant_postprocess import postprocess_hybrid_predictions
+from dlc.hybrid.video_preflight import validate_prepared_video
 
-SR_ACTIONS = {"prepare_hybrid", "full_hybrid", "full_hybrid_train", "full_hybrid_test"}
+_legacy_prepare = _original.prepare_hybrid_video
+_legacy_run_dlc = _original.job_run_hybrid_dlc
 
 
-def _sr_action(name: str) -> Callable[[dict], None]:
+def _stable_prepare(cfg: dict, video: Path) -> dict[str, str]:
+    return prepare_hybrid_video_stable(_legacy_prepare, cfg, video)
+
+
+def _validated_run_dlc(cfg: dict) -> None:
+    validate_video_adaptation(cfg)
+    for value in _original.base_jobs.require_videos(cfg):
+        validate_prepared_video(cfg, Path(value))
+    _legacy_run_dlc(cfg)
+
+
+# The train/test wrappers call these original globals at runtime, so the hooks
+# cover direct actions, held-out videos, and every full-pipeline variant.
+_original.prepare_hybrid_video = _stable_prepare
+_original.job_run_hybrid_dlc = _validated_run_dlc
+_original.postprocess_hybrid_predictions = postprocess_hybrid_predictions
+
+DLC_ACTIONS = {"run_hybrid_dlc", "full_hybrid", "full_hybrid_train", "full_hybrid_test"}
+
+
+def _dlc_action(name: str) -> Callable[[dict], None]:
     def run(cfg: dict) -> None:
-        resolve_super_resolution_model(cfg, repository_root=REPOSITORY_ROOT, require=True)
+        validate_video_adaptation(cfg)
         _base.ALL_JOBS[name](cfg)
+
+    run.__name__ = getattr(_base.ALL_JOBS[name], "__name__", f"job_{name}")
     return run
 
 
 ALL_JOBS = dict(_base.ALL_JOBS)
-for _name in SR_ACTIONS.intersection(ALL_JOBS):
-    ALL_JOBS[_name] = _sr_action(_name)
+for _name in DLC_ACTIONS.intersection(ALL_JOBS):
+    ALL_JOBS[_name] = _dlc_action(_name)
 
 job_prepare_hybrid = ALL_JOBS["prepare_hybrid"]
+job_run_hybrid_dlc = ALL_JOBS["run_hybrid_dlc"]
+job_postprocess_hybrid = ALL_JOBS["postprocess_hybrid"]
 job_full_hybrid = ALL_JOBS["full_hybrid"]
 
 
