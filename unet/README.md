@@ -424,6 +424,21 @@ Outputs in the inference folder:
 - `mouse_miniscope_mask.mp4` — binary clean mask from the same single pass;
 - `head_track_metadata.json` — device, head-valid percentage, excluded frames.
 
+### Head-direction visualization
+
+After inference, plot the body-centroid-to-head direction over time and its
+3D relationship with body position:
+
+```powershell
+python unet/visualize_trajectory.py --result-dir "results/video_unet" --show
+```
+
+The command writes `trajectory_head_angle_time.png`,
+`trajectory_head_angle_3d.png`, and `trajectory_with_head_angle.csv` into the
+result directory. The CSV contains the raw circular angle in `[-180, 180]`
+degrees and an unwrapped angle for continuous time-series inspection. Missing
+head detections remain missing and separate unwrapped trajectory segments.
+
 ## Important scope
 
 The binary model is deliberately the first production step because current
