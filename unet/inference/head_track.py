@@ -81,6 +81,10 @@ def main() -> None:
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--fibre-opening", type=int, default=5)
     p.add_argument("--reacquire-sec", type=float, default=.35)
+    p.add_argument("--motion-min-speed", type=float, default=.35,
+                   help="minimum smoothed centroid speed (rectified px/frame) for motion head cue")
+    p.add_argument("--motion-confirm-frames", type=int, default=2,
+                   help="consecutive moving frames before motion can resolve head/tail")
     p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
                    help="arena turned vs training: rotate frames before the CNN "
                         "(ROI corners are rotated too; output stays in source space)")
@@ -172,7 +176,9 @@ def main() -> None:
     mw = cv2.VideoWriter(str(out / "mouse_miniscope_mask.mp4"), fourcc, fps, (w, h))
     tracker = ReflectionTracker(fps)
     head_temporal = HeadTemporalStabilizer(max_gap_frames=max(5, round(fps * 0.5)))
-    head_anatomy = AnatomicalHeadConstraint()
+    head_anatomy = AnatomicalHeadConstraint(
+        motion_min_speed=max(0.0, a.motion_min_speed),
+        motion_confirm_frames=max(2, a.motion_confirm_frames))
     temporal = TemporalMaskFilter(fps=fps, opening_px=a.fibre_opening, hold_frames=3,
                                   reacquire_frames=max(8, round(fps * a.reacquire_sec)))
     manual_heads = pd.DataFrame()
@@ -199,6 +205,7 @@ def main() -> None:
         disagreement = np.nan
         anatomy_corrected = False; body_elongation = np.nan
         tail_hint_detected = False; head_outside_distance = np.nan
+        motion_speed = 0.0; motion_alignment = np.nan; motion_corrected = False
         if i in excluded:
             body = head = None; conf = 0.0; overlay = frame.copy()
             cv2.rectangle(overlay, (0, 0), (overlay.shape[1] - 1, overlay.shape[0] - 1), (0, 0, 220), 6)
@@ -346,6 +353,9 @@ def main() -> None:
                         body_elongation = anatomy.elongation
                         tail_hint_detected = anatomy.tail_detected
                         head_outside_distance = anatomy.outside_distance_px
+                        motion_speed = anatomy.motion_speed_px
+                        motion_alignment = anatomy.motion_alignment
+                        motion_corrected = anatomy.motion_corrected
                         choice = head_temporal.update(body, choice)
                         choice = clamp_choice_to_mask(choice, body_mask)
                         head, conf, head_source = choice.point, choice.confidence, choice.source
@@ -411,7 +421,8 @@ def main() -> None:
                      learned_reflection_cm[0], learned_reflection_cm[1],
                      learned_reflection_conf, reflection_source, reflection_disagreement,
                      head_source, disagreement, anatomy_corrected, body_elongation,
-                     tail_hint_detected, head_outside_distance))
+                     tail_hint_detected, head_outside_distance, motion_speed,
+                     motion_alignment, motion_corrected))
         i += 1
     cap.release(); ow.release(); mw.release()
     df = pd.DataFrame(rows, columns=["frame", "timestamp_sec", "body_x_cm", "body_y_cm",
@@ -423,7 +434,9 @@ def main() -> None:
                                      "reflection_disagreement_px",
                                      "head_source", "head_disagreement_px",
                                      "head_anatomy_corrected", "body_elongation",
-                                     "tail_hint_detected", "head_outside_distance_px"])
+                                     "tail_hint_detected", "head_outside_distance_px",
+                                     "body_motion_speed_px_per_frame",
+                                     "head_motion_alignment", "head_motion_corrected"])
     df.to_csv(out / "head_track_trajectory.csv", index=False, float_format="%.5f")
     (out / "head_track_metadata.json").write_text(json.dumps(
         {"input": str(Path(a.video).resolve()), "model": str(Path(a.model).resolve()),
@@ -433,6 +446,11 @@ def main() -> None:
          "anatomical_head_constraint": {
              "mask_containment": True, "major_axis_endpoints": True,
              "contained_tail_vs_boundary_fibre": True, "flip_confirm_frames": 4},
+         "motion_direction_constraint": {
+             "enabled": True, "minimum_speed_px_per_frame": a.motion_min_speed,
+             "minimum_axis_alignment": 0.45,
+             "confirm_frames": max(2, a.motion_confirm_frames),
+             "large_jump_rejection": True},
          "head_source_counts": {str(k): int(v) for k, v in df.head_source.value_counts().items()},
          "reflection_policy": ("learned_primary_heuristic_fallback"
                                if learned_reflection_enabled
@@ -452,6 +470,8 @@ def main() -> None:
              100 * float(df.head_anatomy_corrected.map(as_bool).mean()), 2),
          "tail_hint_detected_percent": round(
              100 * float(df.tail_hint_detected.map(as_bool).mean()), 2),
+         "head_motion_corrected_percent": round(
+             100 * float(df.head_motion_corrected.map(as_bool).mean()), 2),
          "head_reliable_percent": round(100 * float((df.head_x_cm.notna() &
                                                        (df.head_confidence >= 0.20)).mean()), 2),
          "excluded_frames": sorted(excluded & set(range(i)))}, indent=2), encoding="utf-8")

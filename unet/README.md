@@ -415,6 +415,21 @@ training videos, two layers fix it:
    checkpoints without a head decoder fall back to `ReflectionTracker`;
 5. excluded frames (from `screening.csv`) are NaN rows with an EXCLUDED border.
 
+For freely moving frames, a gated locomotion prior also resolves head/tail
+ambiguity: after at least two frames of non-trivial centroid motion, a head
+candidate on the side opposite the motion direction is moved to the
+motion-consistent major-axis endpoint. The prior is disabled during low-speed
+turning/grooming, rejected when motion is sideways to the body axis, and reset
+after handling-sized jumps or mask reacquisition. Manual verified head points
+always take priority. Diagnostics are exported as
+`body_motion_speed_px_per_frame`, `head_motion_alignment`, and
+`head_motion_corrected`.
+
+The conservative defaults are `--motion-min-speed 0.35` rectified pixels per
+frame and `--motion-confirm-frames 2`. Increase either value if grooming or
+mask-centroid jitter causes false corrections; decrease the speed threshold
+only when genuine slow locomotion is not being corrected.
+
 Outputs in the inference folder:
 
 - `head_track_trajectory.csv` — `frame, timestamp_sec, body_x_cm, body_y_cm,

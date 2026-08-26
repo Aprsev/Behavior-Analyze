@@ -72,6 +72,38 @@ class AnatomicalHeadTests(unittest.TestCase):
                        "reflection_reflection_model_disagrees", 50.0))
         self.assertGreater(result.choice.point[0], 90)
 
+    def test_sustained_motion_corrects_consensus_at_tail(self):
+        mask = self.elongated_mask()
+        tracker = AnatomicalHeadConstraint(motion_confirm_frames=2)
+        wrong = HeadChoice((48, 60), .9,
+                           "fused_reflection_primary_reflection_model_consensus", None)
+        tracker.update((80, 60), mask, mask, wrong)
+        tracker.update((81, 60), mask, mask, wrong)
+        result = tracker.update((82, 60), mask, mask, wrong)
+        self.assertTrue(result.motion_corrected)
+        self.assertGreater(result.choice.point[0], 90)
+        self.assertTrue(result.choice.source.startswith("motion_direction_corrected_"))
+
+    def test_stationary_mouse_keeps_reflection_choice(self):
+        mask = self.elongated_mask()
+        tracker = AnatomicalHeadConstraint(motion_confirm_frames=2)
+        wrong = HeadChoice((48, 60), .9,
+                           "fused_reflection_primary_reflection_model_consensus", None)
+        tracker.update((90, 60), mask, mask, wrong)
+        tracker.update((90.05, 60), mask, mask, wrong)
+        result = tracker.update((90.10, 60), mask, mask, wrong)
+        self.assertFalse(result.motion_corrected)
+        self.assertLess(result.choice.point[0], 90)
+
+    def test_handling_jump_is_not_treated_as_locomotion(self):
+        mask = self.elongated_mask()
+        tracker = AnatomicalHeadConstraint(motion_confirm_frames=2)
+        wrong = HeadChoice((48, 60), .9,
+                           "fused_reflection_primary_reflection_model_consensus", None)
+        tracker.update((40, 60), mask, mask, wrong)
+        result = tracker.update((100, 60), mask, mask, wrong)
+        self.assertFalse(result.motion_corrected)
+
 
 if __name__ == "__main__":
     unittest.main()

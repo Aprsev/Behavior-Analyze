@@ -17,6 +17,9 @@ class AnatomyResult:
     tail_detected: bool
     corrected: bool
     outside_distance_px: float
+    motion_speed_px: float = 0.0
+    motion_alignment: float = float("nan")
+    motion_corrected: bool = False
 
 
 def _main_contour(mask: np.ndarray) -> np.ndarray | None:
@@ -76,15 +79,52 @@ def clamp_choice_to_mask(choice: HeadChoice, mask: np.ndarray) -> HeadChoice:
 class AnatomicalHeadConstraint:
     """Resolve head/tail ambiguity using shape, appendages and continuity."""
 
-    def __init__(self, elongated_ratio: float = 1.35, flip_confirm_frames: int = 4):
+    def __init__(self, elongated_ratio: float = 1.35, flip_confirm_frames: int = 4,
+                 motion_min_speed: float = 0.35, motion_confirm_frames: int = 2):
         self.elongated_ratio = float(elongated_ratio)
         self.flip_confirm_frames = max(2, int(flip_confirm_frames))
         self.previous_direction: np.ndarray | None = None
         self.flip_votes = 0
+        self.motion_min_speed = float(motion_min_speed)
+        self.motion_confirm_frames = max(2, int(motion_confirm_frames))
+        self.previous_body: np.ndarray | None = None
+        self.motion_velocity: np.ndarray | None = None
+        self.motion_streak = 0
 
     def reset(self) -> None:
         self.previous_direction = None
         self.flip_votes = 0
+        self.previous_body = None
+        self.motion_velocity = None
+        self.motion_streak = 0
+
+    def _motion_direction(self, body: np.ndarray, major_length: float):
+        """Return a conservative centroid-velocity direction and speed.
+
+        Large discontinuities are treated as handling/reacquisition rather
+        than locomotion. An EMA suppresses centroid-mask jitter, while the
+        streak gate prevents one noisy displacement from deciding head/tail.
+        """
+        if self.previous_body is None:
+            self.previous_body = body.copy()
+            return None, 0.0
+        delta = body - self.previous_body
+        self.previous_body = body.copy()
+        instantaneous = float(np.linalg.norm(delta))
+        if instantaneous > max(10.0, 0.75 * major_length):
+            self.motion_velocity = None
+            self.motion_streak = 0
+            return None, 0.0
+        self.motion_velocity = (delta.copy() if self.motion_velocity is None else
+                                0.65 * self.motion_velocity + 0.35 * delta)
+        speed = float(np.linalg.norm(self.motion_velocity))
+        if speed >= self.motion_min_speed:
+            self.motion_streak += 1
+        else:
+            self.motion_streak = 0
+        if self.motion_streak < self.motion_confirm_frames or speed <= 1e-6:
+            return None, speed
+        return self.motion_velocity / speed, speed
 
     @staticmethod
     def geometry(mask: np.ndarray):
@@ -152,6 +192,7 @@ class AnatomicalHeadConstraint:
             return AnatomyResult(choice, 1.0, False, False, 0.0)
         contour, _, endpoints, elongation, major_length = geometry
         b = np.asarray(body, float)
+        motion_direction, motion_speed = self._motion_direction(b, major_length)
         candidate = np.asarray(choice.point, float) if choice.point is not None else None
         corrected = False; outside_distance = 0.0
         if candidate is not None and np.isfinite(candidate).all():
@@ -195,6 +236,16 @@ class AnatomicalHeadConstraint:
                     reflection_level = 1
 
         tail_head_index = 1 - tail_index if tail_index is not None else None
+        motion_head_index = None
+        motion_alignment = float("nan")
+        if motion_direction is not None:
+            alignments = [float(np.dot(direction, motion_direction)) for direction in directions]
+            best_motion_index = int(np.argmax(alignments))
+            # Motion only resolves a genuine axial head/tail ambiguity. Sideways
+            # centroid drift from segmentation, grooming or turning is ignored.
+            if (alignments[best_motion_index] >= 0.45 and
+                    alignments[1 - best_motion_index] <= -0.25):
+                motion_head_index = best_motion_index
         if reflection_direction_cue and (
                 reflection_level >= 2 or tail_head_index is None or
                 self.previous_direction is not None):
@@ -212,11 +263,21 @@ class AnatomicalHeadConstraint:
         else:
             return AnatomyResult(choice, elongation, False, corrected, outside_distance)
 
+        source_lower = str(choice.source).lower()
+        manual_choice = "manual" in source_lower
+        motion_corrected = False
+        if motion_head_index is not None:
+            motion_alignment = float(np.dot(directions[head_index], motion_direction))
+            if head_index != motion_head_index and not manual_choice:
+                head_index = motion_head_index
+                motion_corrected = True
+
         proposed_direction = directions[head_index]
         if self.previous_direction is not None and np.dot(proposed_direction, self.previous_direction) < 0:
             self.flip_votes += 1
             required_votes = (
                 1 if reflection_level >= 2 else
+                self.motion_confirm_frames if motion_corrected else
                 2 if reflection_level == 1 else
                 self.flip_confirm_frames
             )
@@ -224,6 +285,7 @@ class AnatomicalHeadConstraint:
                 head_index = int(np.argmax([float(np.dot(direction, self.previous_direction))
                                             for direction in directions]))
                 proposed_direction = directions[head_index]
+                motion_corrected = False
         else:
             self.flip_votes = 0
 
@@ -252,6 +314,16 @@ class AnatomicalHeadConstraint:
             source = prefix + choice.source
             confidence = choice.confidence * (0.75 if outside_distance else 1.0)
 
+        if motion_corrected:
+            # Both learned points may agree at the tail. Move the final point
+            # onto the motion-consistent anatomical endpoint and make the
+            # correction explicit for CSV/video auditing.
+            candidate = head_endpoint.copy()
+            corrected = True
+            source = "motion_direction_corrected_" + choice.source
+            confidence = min(0.75, max(0.20, choice.confidence))
+            motion_alignment = float(np.dot(proposed_direction, motion_direction))
+
         self.previous_direction = proposed_direction if self.previous_direction is None else (
             0.82 * self.previous_direction + 0.18 * proposed_direction)
         self.previous_direction /= max(
@@ -260,7 +332,8 @@ class AnatomicalHeadConstraint:
                                  choice.disagreement_px)
         constrained = clamp_choice_to_mask(constrained, body_mask)
         return AnatomyResult(constrained, elongation, tail_detected, corrected,
-                             outside_distance)
+                             outside_distance, motion_speed, motion_alignment,
+                             motion_corrected)
 
 
 def appendage_foreground(rectified_frame: np.ndarray, background: np.ndarray,
