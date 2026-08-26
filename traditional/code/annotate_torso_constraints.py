@@ -188,11 +188,25 @@ def merge_annotation_exclusions(screening_csv: str, video_name: str, label_rows:
         return
     path = Path(screening_csv)
     df = pd.read_csv(path)
+    if 'exclude' not in df:
+        df['exclude'] = False
+    # pandas >= 2.2 rejects assigning integer 0/1 into a strict bool column.
+    # Normalize legacy strings/integers once, then only assign real bools.
+    df['exclude'] = df['exclude'].map(as_bool).astype(bool)
+    frame_values = pd.to_numeric(df.get('frame'), errors='coerce')
     values = {int(row['frame']): as_bool(row.get('exclude')) for row in label_rows}
     for frame, excluded in values.items():
         matches = video_mask(df.video, video_name) if 'video' in df else pd.Series(True, index=df.index)
-        df.loc[matches & (df.frame == frame), 'exclude'] = int(excluded)
-    df.to_csv(path, index=False)
+        df.loc[matches & (frame_values == frame), 'exclude'] = bool(excluded)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    df.to_csv(temporary, index=False)
+    # Read-back verifies that pandas did not silently coerce True/False into
+    # an unusable mixed column before replacing the live candidate CSV.
+    check = pd.read_csv(temporary)
+    if 'exclude' not in check:
+        temporary.unlink(missing_ok=True)
+        raise IOError('candidate exclusion save verification failed')
+    temporary.replace(path)
     print(f'Synchronized exclusion state for {len(values)} annotations in {screening_csv}')
 
 
@@ -364,7 +378,13 @@ def main() -> None:
         # Merge into the shared CSV: this session only replaces its own
         # (video, frame) rows; every other video's annotations are kept.
         merge_labels(Path(args.output), Path(args.input).name, rows)
-        merge_annotation_exclusions(args.candidate_csv, Path(args.input).name, rows)
+        try:
+            merge_annotation_exclusions(args.candidate_csv, Path(args.input).name, rows)
+        except Exception as exc:
+            # Polygon labels are the training source of truth and were already
+            # atomically verified above. Candidate exclusion synchronization
+            # is secondary and must not make S look unsaved or close the queue.
+            print(f'WARNING: polygon saved, but candidate exclusion sync failed: {exc}')
         state['error']=''
         return True
     cv2.namedWindow(title,cv2.WINDOW_NORMAL); cv2.setMouseCallback(title,mouse); load()

@@ -3,11 +3,16 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import sys
 
 import pandas as pd
 
 from core.label_compat import (as_bool, atomic_upsert_head, atomic_upsert_polygon,
                           normalize_polygon, video_matches)
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.append(str(ROOT / "traditional" / "code"))
+from annotate_torso_constraints import merge_annotation_exclusions  # noqa: E402
 
 
 class LabelCompatibilityTests(unittest.TestCase):
@@ -61,6 +66,18 @@ class LabelCompatibilityTests(unittest.TestCase):
         self.assertTrue(bool(result.head_verified.iloc[0]))
         self.assertTrue(bool(result.reflection_verified.iloc[0]))
         self.assertTrue(labels.with_suffix(".csv.bak").is_file())
+
+    def test_candidate_bool_exclusion_update_is_pandas_compatible(self):
+        folder = Path(tempfile.mkdtemp()); candidates = folder / "candidates.csv"
+        pd.DataFrame([
+            {"video": "video.avi", "frame": 4, "exclude": False},
+            {"video": "video.avi", "frame": 5, "exclude": True},
+        ]).to_csv(candidates, index=False)
+        merge_annotation_exclusions(
+            str(candidates), "video.avi",
+            [{"frame": 4, "exclude": False}, {"frame": 5, "exclude": False}])
+        result = pd.read_csv(candidates)
+        self.assertFalse(result.exclude.map(as_bool).any())
 
 
 if __name__ == "__main__":
