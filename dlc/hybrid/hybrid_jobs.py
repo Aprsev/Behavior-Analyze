@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Public hybrid worker with SR, DLC, and video-integrity safeguards."""
+"""Public hybrid worker with supervised DLC project auto-discovery."""
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 from typing import Callable
@@ -13,41 +14,26 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from dlc.hybrid import _active_jobs_impl as _config
-from dlc.hybrid import _hybrid_jobs_impl as _original
-from dlc.hybrid import _sr_preflight_jobs as _base
-from dlc.hybrid._sr_preflight_jobs import *  # noqa: E402,F401,F403
-from dlc.hybrid.dlc_runtime import validate_video_adaptation
-from dlc.hybrid.stable_video import prepare_hybrid_video_stable
-from dlc.hybrid.tolerant_postprocess import postprocess_hybrid_predictions
-from dlc.hybrid.video_preflight import validate_prepared_video
+from dlc.hybrid import _video_safe_jobs as _base
+from dlc.hybrid._video_safe_jobs import *  # noqa: E402,F401,F403
+from dlc.hybrid.project_config import resolve_project_config
 
-_legacy_prepare = _original.prepare_hybrid_video
-_legacy_run_dlc = _original.job_run_hybrid_dlc
-
-
-def _stable_prepare(cfg: dict, video: Path) -> dict[str, str]:
-    return prepare_hybrid_video_stable(_legacy_prepare, cfg, video)
+PROJECT_REQUIRED_ACTIONS = {
+    "add_videos", "extract_frames", "label_frames", "check_labels",
+    "build_dataset", "train", "evaluate", "analyze", "filter_predictions",
+    "create_labeled_video", "plot_trajectories", "extract_outliers",
+    "refine_labels", "merge_datasets",
+}
 
 
-def _validated_run_dlc(cfg: dict) -> None:
-    validate_video_adaptation(cfg)
-    for value in _original.base_jobs.require_videos(cfg):
-        validate_prepared_video(cfg, Path(value))
-    _legacy_run_dlc(cfg)
-
-
-# The train/test wrappers call these original globals at runtime, so the hooks
-# cover direct actions, held-out videos, and every full-pipeline variant.
-_original.prepare_hybrid_video = _stable_prepare
-_original.job_run_hybrid_dlc = _validated_run_dlc
-_original.postprocess_hybrid_predictions = postprocess_hybrid_predictions
-
-DLC_ACTIONS = {"run_hybrid_dlc", "full_hybrid", "full_hybrid_train", "full_hybrid_test"}
-
-
-def _dlc_action(name: str) -> Callable[[dict], None]:
+def _project_action(name: str) -> Callable[[dict], None]:
     def run(cfg: dict) -> None:
-        validate_video_adaptation(cfg)
+        path = resolve_project_config(cfg)
+        print(
+            "HYBRID_GUI_RESULT " + json.dumps({"project_config": str(path)}, ensure_ascii=False),
+            flush=True,
+        )
+        print(f"Using DLC project: {path}", flush=True)
         _base.ALL_JOBS[name](cfg)
 
     run.__name__ = getattr(_base.ALL_JOBS[name], "__name__", f"job_{name}")
@@ -55,13 +41,8 @@ def _dlc_action(name: str) -> Callable[[dict], None]:
 
 
 ALL_JOBS = dict(_base.ALL_JOBS)
-for _name in DLC_ACTIONS.intersection(ALL_JOBS):
-    ALL_JOBS[_name] = _dlc_action(_name)
-
-job_prepare_hybrid = ALL_JOBS["prepare_hybrid"]
-job_run_hybrid_dlc = ALL_JOBS["run_hybrid_dlc"]
-job_postprocess_hybrid = ALL_JOBS["postprocess_hybrid"]
-job_full_hybrid = ALL_JOBS["full_hybrid"]
+for _name in PROJECT_REQUIRED_ACTIONS.intersection(ALL_JOBS):
+    ALL_JOBS[_name] = _project_action(_name)
 
 
 def main() -> int:
