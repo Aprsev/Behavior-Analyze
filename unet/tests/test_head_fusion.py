@@ -3,10 +3,37 @@ import unittest
 import numpy as np
 import pandas as pd
 from tracking.head_fusion import HeadChoice, HeadTemporalStabilizer, choose_head, choose_reflection
-from annotation.annotate_head_results import select_frames
+from annotation.annotate_head_results import display_keypoint_state, select_frames
 
 
 class HeadFusionTests(unittest.TestCase):
+    def test_saved_editor_points_override_automatic_display_but_not_baseline(self):
+        automatic = pd.Series({
+            "head_x_cm": 10, "head_y_cm": 5,
+            "reflection_x_cm": 11, "reflection_y_cm": 5})
+        saved = pd.Series({
+            "head_x_cm": 3, "head_y_cm": 4,
+            "reflection_x_cm": 2, "reflection_y_cm": 4,
+            "head_present": True, "reflection_present": True,
+            "head_verified": True, "reflection_verified": True})
+        state = display_keypoint_state(automatic, saved)
+        self.assertEqual(state["head"], (3., 4.))
+        self.assertEqual(state["reflection"], (2., 4.))
+        self.assertEqual(state["original_head"], (10., 5.))
+
+    def test_saved_absent_point_stays_absent_when_revisited(self):
+        automatic = pd.Series({
+            "head_x_cm": 10, "head_y_cm": 5,
+            "reflection_x_cm": 11, "reflection_y_cm": 5})
+        saved = pd.Series({
+            "head_x_cm": np.nan, "head_y_cm": np.nan,
+            "reflection_x_cm": 2, "reflection_y_cm": 4,
+            "head_present": False, "reflection_present": True,
+            "head_verified": True, "reflection_verified": True})
+        state = display_keypoint_state(automatic, saved)
+        self.assertIsNone(state["head"])
+        self.assertEqual(state["reflection"], (2., 4.))
+
     def test_anatomical_reflection_immediately_reseeds_direction(self):
         stabilizer = HeadTemporalStabilizer()
         stabilizer.update((50, 50), HeadChoice((75, 50), .8, "learned_head", None))

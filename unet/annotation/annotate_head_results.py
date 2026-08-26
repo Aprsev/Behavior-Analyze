@@ -47,6 +47,38 @@ def select_frames(data: pd.DataFrame, existing: set[int], maximum: int) -> list[
     return [frame for _, frame in candidates[:maximum]]
 
 
+def display_keypoint_state(auto_row: pd.Series,
+                           saved_row: pd.Series | None = None) -> dict:
+    """Return editor display values while retaining automatic baselines."""
+    def point(row, prefix):
+        x = pd.to_numeric(row.get(f"{prefix}_x_cm"), errors="coerce")
+        y = pd.to_numeric(row.get(f"{prefix}_y_cm"), errors="coerce")
+        return (float(x), float(y)) if np.isfinite([x, y]).all() else None
+
+    automatic = {prefix: point(auto_row, prefix)
+                 for prefix in ("head", "reflection")}
+    result = {
+        "head": automatic["head"], "reflection": automatic["reflection"],
+        "original_head": automatic["head"],
+        "original_reflection": automatic["reflection"],
+        "head_verified": False, "reflection_verified": False,
+        "exclude": False,
+    }
+    if saved_row is None:
+        return result
+    for prefix in ("head", "reflection"):
+        verified = as_bool(saved_row.get(f"{prefix}_verified", False))
+        present = as_bool(saved_row.get(f"{prefix}_present", True))
+        saved = point(saved_row, prefix)
+        if verified and not present:
+            result[prefix] = None
+        elif saved is not None:
+            result[prefix] = saved
+        result[f"{prefix}_verified"] = verified
+    result["exclude"] = as_bool(saved_row.get("exclude", False))
+    return result
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--video", required=True); p.add_argument("--trajectory", required=True)
@@ -68,11 +100,18 @@ def main() -> None:
     data = pd.read_csv(a.trajectory).drop_duplicates("frame", keep="last").set_index("frame", drop=False)
     existing = set()
     protected_head_frames: set[int] = set()
+    saved_rows: dict[int, pd.Series] = {}
     if Path(a.heads).is_file():
         old = pd.read_csv(a.heads)
         if "video" in old:
             old = old.loc[video_mask(old.video, Path(a.video).name)]
         if "frame" in old:
+            saved_rows = {
+                int(frame): group.iloc[-1]
+                for frame, group in old.assign(
+                    frame=pd.to_numeric(old["frame"], errors="coerce")
+                ).dropna(subset=["frame"]).groupby("frame")
+            }
             head_verified = (old["head_verified"].map(as_bool)
                              if "head_verified" in old else pd.Series(False, index=old.index))
             reflection_verified = (old["reflection_verified"].map(as_bool)
@@ -140,21 +179,15 @@ def main() -> None:
                 float(rect[1] * a.arena_height_cm / (rh - 1)))
 
     def load():
-        row = data.loc[frames[state["i"]]]
-        def point(prefix):
-            x = pd.to_numeric(row.get(f"{prefix}_x_cm"), errors="coerce")
-            y = pd.to_numeric(row.get(f"{prefix}_y_cm"), errors="coerce")
-            return (float(x), float(y)) if np.isfinite([x, y]).all() else None
-        state["head"] = point("head")
-        state["reflection"] = point("reflection")
-        state["exclude"] = False
-        state["head_verified"] = False
-        state["reflection_verified"] = False
+        frame = frames[state["i"]]
+        values = display_keypoint_state(data.loc[frame], saved_rows.get(frame))
+        for key in ("head", "reflection", "exclude", "head_verified",
+                    "reflection_verified", "original_head",
+                    "original_reflection"):
+            state[key] = values[key]
         state["dirty"] = False
         state["head_dirty"] = False
         state["reflection_dirty"] = False
-        state["original_head"] = state["head"]
-        state["original_reflection"] = state["reflection"]
 
     def frame_image():
         frame = frames[state["i"]]
@@ -248,6 +281,18 @@ def main() -> None:
                 source=f"incremental_similarity_propagated_{similarity:.3f}",
                 head_verified=verified["head"],
                 reflection_verified=verified["reflection"])
+            saved_rows[target_frame] = pd.Series({
+                "head_x_cm": values["head"][0] if values["head"] is not None else np.nan,
+                "head_y_cm": values["head"][1] if values["head"] is not None else np.nan,
+                "reflection_x_cm": (values["reflection"][0]
+                                    if values["reflection"] is not None else np.nan),
+                "reflection_y_cm": (values["reflection"][1]
+                                    if values["reflection"] is not None else np.nan),
+                "head_present": values["head"] is not None,
+                "reflection_present": values["reflection"] is not None,
+                "head_verified": verified["head"],
+                "reflection_verified": verified["reflection"],
+                "exclude": False})
             snapshot_mask(target_frame, "head_similarity_support_mask")
             existing.add(target_frame); added += 1
         state["propagated"] += added
@@ -263,6 +308,18 @@ def main() -> None:
                            source="incremental_head_reflection_correction",
                            head_verified=state["head_verified"],
                            reflection_verified=state["reflection_verified"])
+        saved_rows[frame] = pd.Series({
+            "head_x_cm": state["head"][0] if state["head"] is not None else np.nan,
+            "head_y_cm": state["head"][1] if state["head"] is not None else np.nan,
+            "reflection_x_cm": (state["reflection"][0]
+                                if state["reflection"] is not None else np.nan),
+            "reflection_y_cm": (state["reflection"][1]
+                                if state["reflection"] is not None else np.nan),
+            "head_present": state["head"] is not None,
+            "reflection_present": state["reflection"] is not None,
+            "head_verified": state["head_verified"],
+            "reflection_verified": state["reflection_verified"],
+            "exclude": state["exclude"]})
         # The green mask has already been accepted as accurate. Snapshot it as
         # this frame's torso label so every newly corrected head point is
         # actually exportable as a supervised heatmap during the next rebuild.
